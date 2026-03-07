@@ -1,0 +1,169 @@
+Create a fully functional, modern, and production-ready All-in-One Video Downloader Web Application.
+
+The web app must allow users to download videos, audio, thumbnails, and metadata from publicly accessible video URLs where downloading is legally permitted.
+
+Core Requirements:
+
+1. Frontend
+
+- Use modern responsive UI with HTML5, Tailwind CSS, and vanilla JavaScript.
+
+- Mobile-first design that works perfectly on desktop, tablet, and mobile devices.
+
+- Beautiful clean UI similar to modern SaaS tools.
+
+- Include:
+
+  - URL input box
+
+  - Download button
+
+  - Format selection (MP4, MP3, WEBM, etc.)
+
+  - Quality selection (144p to 4K where available)
+
+  - Thumbnail preview
+
+  - Video title and metadata display
+
+  - Progress loader
+
+  - Download buttons for each available format
+
+2. Backend
+
+- Use Node.js with Express or Python with FastAPI.
+
+- Integrate a reliable open-source video extraction library (like yt-dlp or equivalent).
+
+- Handle video metadata fetching, available formats, and download links.
+
+- Ensure efficient processing and caching for faster results.
+
+- Include API endpoints:
+
+  - /api/analyze
+
+  - /api/download
+
+  - /api/thumbnail
+
+  - /api/audio
+
+3. Supported Platforms
+
+Design the architecture so that it supports downloading from multiple platforms where allowed, such as:
+
+- YouTube
+
+- Facebook
+
+- Instagram
+
+- TikTok
+
+- Twitter/X
+
+- Vimeo
+
+- Dailymotion
+
+- Other publicly accessible video URLs
+
+4. Features
+
+- Download video in multiple resolutions
+
+- Extract audio as MP3
+
+- Download video thumbnail
+
+- Show video duration, title, and channel name
+
+- Copy direct download link
+
+- Dark mode toggle
+
+- Multilingual support
+
+- Fast loading performance
+
+- SEO optimized pages
+
+- PWA support so users can install the web app like a mobile app
+
+5. Security
+
+- Sanitize all user inputs
+
+- Rate limit API requests
+
+- Prevent malicious file injection
+
+- Validate URLs before processing
+
+- Protect backend from abuse and server overload
+
+6. Performance
+
+- Use caching for repeated requests
+
+- Optimize file processing
+
+- Use async background jobs for heavy downloads
+
+7. Deployment Ready
+
+Provide full project structure including:
+
+- frontend folder
+
+- backend folder
+
+- environment configuration
+
+- package.json or requirements.txt
+
+- Dockerfile (optional)
+
+- deployment instructions for:
+
+  - Vercel
+
+  - Render
+
+  - Railway
+
+  - VPS
+
+8. Extra Features
+
+- Download playlist videos
+
+- Batch downloads
+
+- Generate QR code for download link
+
+- Share button
+
+- Download history for the session
+
+- Simple analytics dashboard
+
+9. Deliverables
+
+The final output must include:
+
+- Complete source code
+
+- Fully working UI
+
+- API endpoints
+
+- Error handling
+
+- Clear comments in code
+
+- Setup and deployment guide
+
+The final web application must run without errors, must be scalable, secure, and optimized for production use.
