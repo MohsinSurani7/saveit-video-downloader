@@ -8,6 +8,8 @@ import * as os from "node:os";
 
 const execFileAsync = promisify(execFile);
 
+const YT_DLP_PATH = path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
+
 interface VideoFormat {
   formatId: string;
   ext: string;
@@ -149,7 +151,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json(cached.data);
       }
 
-      const { stdout } = await execFileAsync("yt-dlp", [
+      const { stdout } = await execFileAsync(YT_DLP_PATH, [
         "--dump-json",
         "--no-download",
         "--no-playlist",
@@ -218,7 +220,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         args.splice(args.length - 1, 0, "-f", "best");
       }
 
-      const { stdout } = await execFileAsync("yt-dlp", args, {
+      const { stdout } = await execFileAsync(YT_DLP_PATH, args, {
         timeout: 30000,
       });
 
@@ -242,7 +244,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "Invalid URL" });
       }
 
-      const { stdout } = await execFileAsync("yt-dlp", [
+      const { stdout } = await execFileAsync(YT_DLP_PATH, [
         "--get-thumbnail",
         "--no-download",
         "--no-playlist",
