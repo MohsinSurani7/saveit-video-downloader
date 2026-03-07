@@ -1,6 +1,6 @@
 import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -50,6 +50,10 @@ function isValidUrl(str: string): boolean {
 
 function sanitizeUrl(url: string): string {
   return url.trim().replace(/[;&|`$(){}]/g, "");
+}
+
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100);
 }
 
 function detectPlatform(url: string): string {
@@ -128,6 +132,27 @@ function checkRateLimit(ip: string): boolean {
   return entry.count <= RATE_LIMIT;
 }
 
+const TEMP_DIR = path.join(os.tmpdir(), "saveit-downloads");
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+function cleanupOldFiles() {
+  try {
+    const files = fs.readdirSync(TEMP_DIR);
+    const now = Date.now();
+    for (const file of files) {
+      const filePath = path.join(TEMP_DIR, file);
+      const stat = fs.statSync(filePath);
+      if (now - stat.mtimeMs > 10 * 60 * 1000) {
+        fs.unlinkSync(filePath);
+      }
+    }
+  } catch {}
+}
+
+setInterval(cleanupOldFiles, 5 * 60 * 1000);
+
 export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/analyze", async (req: Request, res: Response) => {
     try {
@@ -195,7 +220,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(429).json({ error: "Too many requests" });
       }
 
-      const { url, formatId, type } = req.body;
+      const { url, formatId, type, title } = req.body;
       if (!url || typeof url !== "string") {
         return res.status(400).json({ error: "URL is required" });
       }
@@ -205,30 +230,89 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "Invalid URL" });
       }
 
+      const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const ext = type === "audio" ? "mp3" : "mp4";
+      const outputFilename = `${fileId}.${ext}`;
+      const outputPath = path.join(TEMP_DIR, outputFilename);
+
       const args: string[] = [
         "--no-playlist",
         "--no-warnings",
-        "-g",
-        cleanUrl,
+        "-o", outputPath,
       ];
 
       if (type === "audio") {
-        args.splice(args.length - 1, 0, "-f", "bestaudio");
+        args.push("-f", "bestaudio", "--extract-audio", "--audio-format", "mp3");
       } else if (formatId) {
-        args.splice(args.length - 1, 0, "-f", `${formatId}+bestaudio/best`);
+        args.push("-f", `${formatId}+bestaudio/${formatId}/best`);
+        args.push("--merge-output-format", "mp4");
       } else {
-        args.splice(args.length - 1, 0, "-f", "best");
+        args.push("-f", "best");
       }
 
-      const { stdout } = await execFileAsync(YT_DLP_PATH, args, {
-        timeout: 30000,
+      args.push(cleanUrl);
+
+      await execFileAsync(YT_DLP_PATH, args, {
+        timeout: 120000,
+        maxBuffer: 10 * 1024 * 1024,
       });
 
-      const downloadUrl = stdout.trim().split("\n")[0];
-      return res.json({ downloadUrl });
+      const safeTitle = sanitizeFilename(title || "video");
+      const finalFilename = `${safeTitle}.${ext}`;
+
+      const actualFiles = fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(fileId));
+      if (actualFiles.length === 0) {
+        return res.status(500).json({ error: "Download failed - file not created" });
+      }
+
+      const actualFile = actualFiles[0];
+      const actualPath = path.join(TEMP_DIR, actualFile);
+
+      return res.json({
+        fileId: actualFile,
+        filename: finalFilename,
+        downloadPath: `/api/file/${actualFile}?name=${encodeURIComponent(finalFilename)}`,
+      });
     } catch (error: any) {
       console.error("Download error:", error.message);
-      return res.status(500).json({ error: "Failed to get download link" });
+      return res.status(500).json({ error: "Failed to download video. Please try again." });
+    }
+  });
+
+  app.get("/api/file/:fileId", (req: Request, res: Response) => {
+    try {
+      const { fileId } = req.params;
+      const safeName = fileId.replace(/[^a-zA-Z0-9._-]/g, "");
+      const filePath = path.join(TEMP_DIR, safeName);
+
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: "File not found or expired" });
+      }
+
+      const stat = fs.statSync(filePath);
+      const filename = (req.query.name as string) || safeName;
+      const ext = path.extname(safeName).toLowerCase();
+
+      let contentType = "application/octet-stream";
+      if (ext === ".mp4") contentType = "video/mp4";
+      else if (ext === ".mp3") contentType = "audio/mpeg";
+      else if (ext === ".webm") contentType = "video/webm";
+
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Content-Length", stat.size);
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+      const stream = fs.createReadStream(filePath);
+      stream.pipe(res);
+
+      stream.on("end", () => {
+        setTimeout(() => {
+          try { fs.unlinkSync(filePath); } catch {}
+        }, 60000);
+      });
+    } catch (error: any) {
+      console.error("File serve error:", error.message);
+      return res.status(500).json({ error: "Failed to serve file" });
     }
   });
 

@@ -6,12 +6,13 @@ import {
   StyleSheet,
   Alert,
   Platform,
-  Linking,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useMutation } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/query-client";
+import * as FileSystem from "expo-file-system";
+import * as Sharing from "expo-sharing";
+import { apiRequest, getApiUrl } from "@/lib/query-client";
 import { useTheme } from "@/lib/useTheme";
 import { VideoInfo, VideoFormat } from "@/lib/types";
 import { addToHistory } from "@/lib/history";
@@ -28,6 +29,7 @@ export default function DownloadScreen() {
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
   const [selectedFormat, setSelectedFormat] = useState<VideoFormat | null>(null);
   const [downloadType, setDownloadType] = useState<"video" | "audio">("video");
+  const [downloadProgress, setDownloadProgress] = useState(0);
 
   const analyzeMutation = useMutation({
     mutationFn: async (url: string) => {
@@ -50,32 +52,77 @@ export default function DownloadScreen() {
     mutationFn: async () => {
       if (!videoInfo) throw new Error("No video selected");
 
+      setDownloadProgress(0);
+
       const res = await apiRequest("POST", "/api/download", {
         url: videoInfo.url,
         formatId: selectedFormat?.formatId,
         type: downloadType,
+        title: videoInfo.title,
       });
-      return (await res.json()) as { downloadUrl: string };
+      const data = (await res.json()) as {
+        fileId: string;
+        filename: string;
+        downloadPath: string;
+      };
+
+      if (Platform.OS === "web") {
+        const baseUrl = getApiUrl();
+        const fileUrl = new URL(data.downloadPath, baseUrl).toString();
+        const link = document.createElement("a");
+        link.href = fileUrl;
+        link.download = data.filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        return data;
+      }
+
+      const baseUrl = getApiUrl();
+      const fileUrl = new URL(data.downloadPath, baseUrl).toString();
+      const localUri = FileSystem.documentDirectory + data.filename;
+
+      const downloadResumable = FileSystem.createDownloadResumable(
+        fileUrl,
+        localUri,
+        {},
+        (progress) => {
+          const pct = progress.totalBytesWritten / progress.totalBytesExpectedToWrite;
+          setDownloadProgress(Math.round(pct * 100));
+        }
+      );
+
+      const result = await downloadResumable.downloadAsync();
+      if (!result?.uri) throw new Error("Download failed");
+
+      const canShare = await Sharing.isAvailableAsync();
+      if (canShare) {
+        await Sharing.shareAsync(result.uri, {
+          mimeType: downloadType === "audio" ? "audio/mpeg" : "video/mp4",
+          dialogTitle: "Save " + data.filename,
+        });
+      }
+
+      return data;
     },
     onSuccess: async (data) => {
-      if (data.downloadUrl) {
-        if (videoInfo) {
-          await addToHistory({
-            id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
-            title: videoInfo.title,
-            thumbnail: videoInfo.thumbnail,
-            platform: videoInfo.platform,
-            quality: selectedFormat?.quality || "best",
-            format: selectedFormat?.ext || (downloadType === "audio" ? "mp3" : "mp4"),
-            timestamp: Date.now(),
-            url: videoInfo.url,
-          });
-        }
-        Linking.openURL(data.downloadUrl);
+      setDownloadProgress(0);
+      if (videoInfo) {
+        await addToHistory({
+          id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+          title: videoInfo.title,
+          thumbnail: videoInfo.thumbnail,
+          platform: videoInfo.platform,
+          quality: selectedFormat?.quality || "best",
+          format: selectedFormat?.ext || (downloadType === "audio" ? "mp3" : "mp4"),
+          timestamp: Date.now(),
+          url: videoInfo.url,
+        });
       }
     },
     onError: (error: Error) => {
-      Alert.alert("Error", error.message || "Failed to get download link");
+      setDownloadProgress(0);
+      Alert.alert("Error", error.message || "Failed to download");
     },
   });
 
@@ -100,6 +147,8 @@ export default function DownloadScreen() {
     },
     [videoInfo]
   );
+
+  const isDownloading = downloadMutation.isPending;
 
   return (
     <View style={[styles.screen, { backgroundColor: theme.background }]}>
@@ -147,12 +196,40 @@ export default function DownloadScreen() {
               onChangeType={handleTypeChange}
             />
 
+            {isDownloading && downloadProgress > 0 && (
+              <View style={styles.progressContainer}>
+                <View
+                  style={[
+                    styles.progressBarBg,
+                    { backgroundColor: theme.surfaceSecondary },
+                  ]}
+                >
+                  <View
+                    style={[
+                      styles.progressBarFill,
+                      {
+                        backgroundColor: theme.success,
+                        width: `${downloadProgress}%` as any,
+                      },
+                    ]}
+                  />
+                </View>
+                <Text style={[styles.progressText, { color: theme.textSecondary }]}>
+                  Downloading... {downloadProgress}%
+                </Text>
+              </View>
+            )}
+
             <DownloadButton
               onPress={handleDownload}
-              isLoading={downloadMutation.isPending}
+              isLoading={isDownloading}
               disabled={!selectedFormat && downloadType === "video"}
               label={
-                downloadType === "audio" ? "Download Audio" : "Download Video"
+                isDownloading && downloadProgress > 0
+                  ? `${downloadProgress}%`
+                  : downloadType === "audio"
+                  ? "Download Audio"
+                  : "Download Video"
               }
             />
           </>
@@ -229,6 +306,23 @@ const styles = StyleSheet.create({
   shimmerMeta: {
     height: 14,
     width: "50%",
+  },
+  progressContainer: {
+    gap: 6,
+  },
+  progressBarBg: {
+    height: 6,
+    borderRadius: 3,
+    overflow: "hidden",
+  },
+  progressBarFill: {
+    height: "100%",
+    borderRadius: 3,
+  },
+  progressText: {
+    fontSize: 12,
+    fontFamily: "Inter_500Medium",
+    textAlign: "center",
   },
   emptyState: {
     alignItems: "center",
