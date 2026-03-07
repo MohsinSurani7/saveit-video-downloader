@@ -44,7 +44,6 @@ function ClassicTabLayout() {
           borderTopWidth: 0,
           elevation: 0,
           height: Platform.OS === "web" ? 84 : undefined,
-          paddingBottom: Platform.OS === "web" ? 34 : undefined,
         },
         tabBarBackground: () =>
           Platform.OS === "ios" ? (

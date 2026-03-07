@@ -53,7 +53,30 @@ function sanitizeUrl(url: string): string {
 }
 
 function sanitizeFilename(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100);
+  return name.replace(/[^a-zA-Z0-9._\- ]/g, "_").slice(0, 100);
+}
+
+const ALLOWED_HOSTS = [
+  "youtube.com", "youtu.be", "www.youtube.com", "m.youtube.com",
+  "facebook.com", "www.facebook.com", "fb.watch",
+  "instagram.com", "www.instagram.com",
+  "tiktok.com", "www.tiktok.com", "vm.tiktok.com",
+  "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+  "vimeo.com", "www.vimeo.com", "player.vimeo.com",
+  "dailymotion.com", "www.dailymotion.com",
+];
+
+function isAllowedHost(urlStr: string): boolean {
+  try {
+    const hostname = new URL(urlStr).hostname.toLowerCase();
+    return ALLOWED_HOSTS.some(h => hostname === h || hostname.endsWith("." + h));
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeContentDisposition(filename: string): string {
+  return filename.replace(/["\\\r\n]/g, "_");
 }
 
 function detectPlatform(url: string): string {
@@ -171,6 +194,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "Invalid URL provided" });
       }
 
+      if (!isAllowedHost(cleanUrl)) {
+        return res.status(400).json({ error: "Unsupported platform. Supported: YouTube, Facebook, Instagram, TikTok, Twitter/X, Vimeo, Dailymotion" });
+      }
+
       const cached = analysisCache.get(cleanUrl);
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         return res.json(cached.data);
@@ -228,6 +255,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const cleanUrl = sanitizeUrl(url);
       if (!isValidUrl(cleanUrl)) {
         return res.status(400).json({ error: "Invalid URL" });
+      }
+
+      if (!isAllowedHost(cleanUrl)) {
+        return res.status(400).json({ error: "Unsupported platform" });
       }
 
       const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -300,7 +331,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.setHeader("Content-Type", contentType);
       res.setHeader("Content-Length", stat.size);
-      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.setHeader("Content-Disposition", `attachment; filename="${sanitizeContentDisposition(filename)}"`);
 
       const stream = fs.createReadStream(filePath);
       stream.pipe(res);
