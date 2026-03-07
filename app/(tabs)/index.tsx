@@ -10,7 +10,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useMutation } from "@tanstack/react-query";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import { apiRequest, getApiUrl } from "@/lib/query-client";
 import { useTheme } from "@/lib/useTheme";
@@ -101,6 +101,8 @@ export default function DownloadScreen() {
           mimeType: downloadType === "audio" ? "audio/mpeg" : "video/mp4",
           dialogTitle: "Save " + data.filename,
         });
+      } else {
+        Alert.alert("Downloaded", `${data.filename} saved successfully`);
       }
 
       return data;
