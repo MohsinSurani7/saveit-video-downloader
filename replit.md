@@ -11,11 +11,12 @@ SaveIt is a mobile-first video downloader app built with Expo (React Native) and
 ## Tech Stack
 - Expo SDK 54 with React Native
 - Express.js backend on port 5000
-- yt-dlp (installed via pip at `.pythonlibs/bin/yt-dlp`) for video metadata and downloading
+- yt-dlp (installed via pip at `.pythonlibs/bin/yt-dlp`, configurable via `YT_DLP_PATH` env var) for video metadata and downloading
 - ffmpeg (system dependency) for audio extraction and format conversion
 - expo-file-system (legacy API) for in-app file downloads
 - expo-sharing for save/share functionality
 - expo-clipboard for URL paste support
+- esbuild for server production bundling
 
 ## Project Structure
 ```
@@ -43,7 +44,7 @@ lib/
 server/
   index.ts             # Express server setup
   routes.ts            # API endpoints (/api/analyze, /api/download, /api/file, /api/thumbnail)
-  storage.ts           # Storage interface
+  templates/           # Landing page HTML template
 ```
 
 ## API Endpoints
@@ -63,8 +64,15 @@ server/
 - Server-side caching for repeated requests
 - Dark/light mode support
 
+## Deployment
+- **Dockerfile**: Backend Docker image with Node.js, Python (yt-dlp), and ffmpeg
+- **eas.json**: EAS Build config for .apk (preview) and .aab (production) builds
+- **Oracle Cloud**: See `ORACLE_CLOUD_DEPLOYMENT.md` for full deployment guide
+- Backend port: 5000, Expo dev server: 8081
+- `EXPO_PUBLIC_DOMAIN` env var controls which backend the app connects to
+
 ## Important Notes
-- yt-dlp binary is at `.pythonlibs/bin/yt-dlp` (installed via pip, NOT the Nix system package which is outdated)
+- yt-dlp path is configurable via `YT_DLP_PATH` env var (defaults to `.pythonlibs/bin/yt-dlp` in dev, `/opt/venv/bin/yt-dlp` in Docker)
 - Downloads use legacy expo-file-system API (`expo-file-system/legacy`)
 - Temp files are cleaned up after 10 minutes
-- Backend serves on port 5000, Expo dev server on port 8081
+- Android package: `com.saveit.app`, iOS bundle: `com.saveit.app`
