@@ -8,7 +8,7 @@ import * as os from "node:os";
 
 const execFileAsync = promisify(execFile);
 
-const YT_DLP_PATH = path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
+const YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
 
 interface VideoFormat {
   formatId: string;
