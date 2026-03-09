@@ -227,10 +227,9 @@ async function registerRoutes(app2) {
       if (type === "audio") {
         args.push("-f", "bestaudio", "--extract-audio", "--audio-format", "mp3");
       } else {
-        args.push("-S", "vcodec:h264,ext:mp4,res");
+        args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
         args.push("-f", "bv*+ba/b");
         args.push("--merge-output-format", "mp4");
-        args.push("--postprocessor-args", "ffmpeg:-c:v libx264 -c:a aac -movflags +faststart");
       }
       args.push(cleanUrl);
       await execFileAsync(YT_DLP_PATH, args, {
