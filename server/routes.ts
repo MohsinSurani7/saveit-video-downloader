@@ -81,7 +81,7 @@ function sanitizeContentDisposition(filename: string): string {
 
 function detectPlatform(url: string): string {
   const hostname = new URL(url).hostname.toLowerCase();
-  if (hostname.includes("youtube.com") || hostname.includes("youtu.be")) return "YouTube";
+  if (hostname.includes("youtube.com") || hostname.includes("youtu.be")) return "Video";
   if (hostname.includes("facebook.com") || hostname.includes("fb.watch")) return "Facebook";
   if (hostname.includes("instagram.com")) return "Instagram";
   if (hostname.includes("tiktok.com")) return "TikTok";
@@ -195,7 +195,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       if (!isAllowedHost(cleanUrl)) {
-        return res.status(400).json({ error: "Unsupported platform. Supported: YouTube, Facebook, Instagram, TikTok, Twitter/X, Vimeo, Dailymotion" });
+        return res.status(400).json({ error: "Unsupported platform. Supported: Facebook, Instagram, TikTok, Twitter/X, Vimeo, Dailymotion, and more" });
       }
 
       const cached = analysisCache.get(cleanUrl);
