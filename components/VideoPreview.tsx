@@ -27,7 +27,7 @@ function formatViewCount(count: number): string {
 
 function getPlatformIcon(platform: string): string {
   switch (platform) {
-    case "YouTube": return "logo-youtube";
+    case "Video": return "videocam-outline";
     case "Facebook": return "logo-facebook";
     case "Instagram": return "logo-instagram";
     case "TikTok": return "logo-tiktok";
@@ -39,7 +39,7 @@ function getPlatformIcon(platform: string): string {
 
 function getPlatformColor(platform: string): string {
   switch (platform) {
-    case "YouTube": return "#FF0000";
+    case "Video": return "#6366F1";
     case "Facebook": return "#1877F2";
     case "Instagram": return "#E4405F";
     case "TikTok": return "#000000";
