@@ -10,6 +10,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 var execFileAsync = promisify(execFile);
 var YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
+var COOKIES_PATH = process.env.COOKIES_PATH || path.join(process.cwd(), "cookies.txt");
+function getCookiesArgs() {
+  if (fs.existsSync(COOKIES_PATH)) {
+    console.log(`Using cookies from: ${COOKIES_PATH}`);
+    return ["--cookies", COOKIES_PATH];
+  }
+  return [];
+}
 var ffmpegAvailable = null;
 async function checkFfmpeg() {
   if (ffmpegAvailable !== null) return ffmpegAvailable;
@@ -215,16 +223,16 @@ async function registerRoutes(app2) {
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         return res.json(cached.data);
       }
-      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, [
+      const analyzeArgs = [
         "--dump-json",
         "--no-download",
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
-        "--extractor-args",
-        "youtube:player_client=android,web",
+        ...getCookiesArgs(),
         cleanUrl
-      ], { timeout: 6e4, maxBuffer: 10 * 1024 * 1024 });
+      ];
+      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, analyzeArgs, { timeout: 6e4, maxBuffer: 10 * 1024 * 1024 });
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
       const videoInfo = {
@@ -274,8 +282,7 @@ async function registerRoutes(app2) {
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
-        "--extractor-args",
-        "youtube:player_client=android,web"
+        ...getCookiesArgs()
       ];
       let ext;
       if (type === "audio") {
