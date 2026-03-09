@@ -11,7 +11,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useMutation } from "@tanstack/react-query";
 import * as FileSystem from "expo-file-system/legacy";
-import * as Sharing from "expo-sharing";
+import * as MediaLibrary from "expo-media-library";
 import { apiRequest, getApiUrl } from "@/lib/query-client";
 import { useTheme } from "@/lib/useTheme";
 import { VideoInfo, VideoFormat } from "@/lib/types";
@@ -95,14 +95,14 @@ export default function DownloadScreen() {
       const result = await downloadResumable.downloadAsync();
       if (!result?.uri) throw new Error("Download failed");
 
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
-        await Sharing.shareAsync(result.uri, {
-          mimeType: downloadType === "audio" ? "audio/mpeg" : "video/mp4",
-          dialogTitle: "Save " + data.filename,
-        });
-      } else {
-        Alert.alert("Downloaded", `${data.filename} saved successfully`);
+      if (Platform.OS !== "web") {
+        const { status } = await MediaLibrary.requestPermissionsAsync();
+        if (status === "granted") {
+          await MediaLibrary.saveToLibraryAsync(result.uri);
+          Alert.alert("Saved", `${data.filename} saved to your gallery`);
+        } else {
+          Alert.alert("Downloaded", `${data.filename} saved to app storage`);
+        }
       }
 
       return data;
@@ -251,7 +251,7 @@ export default function DownloadScreen() {
               Paste a video link to get started
             </Text>
             <Text style={[styles.emptyDesc, { color: theme.textSecondary }]}>
-              Supports YouTube, Facebook, Instagram, TikTok, Twitter, Vimeo, and more
+              Supports Facebook, Instagram, TikTok, Twitter, Vimeo, and more
             </Text>
           </View>
         )}
