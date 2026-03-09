@@ -46,6 +46,13 @@
             "usesCleartextTraffic": true
           }
         }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow SaveIt to save downloaded videos to your gallery.",
+          "savePhotosPermission": "Allow SaveIt to save downloaded videos to your gallery."
+        }
       ]
     ],
     "experiments": {
