@@ -13,7 +13,6 @@ const COOKIES_PATH = process.env.COOKIES_PATH || path.join(process.cwd(), "cooki
 
 function getCookiesArgs(): string[] {
   if (fs.existsSync(COOKIES_PATH)) {
-    console.log(`Using cookies from: ${COOKIES_PATH}`);
     return ["--cookies", COOKIES_PATH];
   }
   return [];
@@ -122,6 +121,8 @@ function detectPlatform(url: string): string {
   return "Other";
 }
 
+const STANDARD_RESOLUTIONS = [2160, 1440, 1080, 720, 480, 360, 240, 144];
+
 function parseFormats(rawFormats: any[]): VideoFormat[] {
   if (!rawFormats) return [];
 
@@ -140,9 +141,10 @@ function parseFormats(rawFormats: any[]): VideoFormat[] {
       const existing = videoByRes.get(height);
       const isH264 = f.vcodec?.startsWith("avc") || f.vcodec?.startsWith("h264");
       const existingIsH264 = existing?.vcodec?.startsWith("avc") || existing?.vcodec?.startsWith("h264");
+      const hasBoth = hasVideo && hasAudio;
+      const existingHasBoth = existing?.acodec !== "none";
 
-      if (!existing || (isH264 && !existingIsH264) || (!existing && !isH264)) {
-        const hasBothTracks = hasVideo && hasAudio;
+      if (!existing || (hasBoth && !existingHasBoth) || (isH264 && !existingIsH264)) {
         videoByRes.set(height, {
           formatId: f.format_id,
           ext: f.ext || "mp4",
@@ -260,11 +262,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
+        "--no-check-formats",
+        "--socket-timeout", "15",
         ...getCookiesArgs(),
         cleanUrl,
       ];
 
-      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, analyzeArgs, { timeout: 60000, maxBuffer: 10 * 1024 * 1024 });
+      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, analyzeArgs, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
 
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
@@ -291,6 +295,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Analyze stderr:", error.stderr || "none");
       if (error.message?.includes("timeout")) {
         return res.status(504).json({ error: "Request timed out. The video might be unavailable." });
+      }
+      const stderrMsg = error.stderr || "";
+      if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
+        return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
       }
       return res.status(500).json({ error: "Failed to analyze video. Please check the URL and try again." });
     }
@@ -324,6 +332,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
+        "--socket-timeout", "15",
+        "--retries", "3",
+        "--concurrent-fragments", "4",
         ...getCookiesArgs(),
       ];
 
@@ -348,6 +359,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
           args.push("-f", "bv*+ba/b");
           args.push("--merge-output-format", "mp4");
+          args.push("--remux-video", "mp4");
         } else {
           args.push("-f", "best[ext=mp4]/best");
         }
@@ -355,21 +367,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       args.push(cleanUrl);
 
-      console.log("Download args:", args.join(" "));
+      console.log("Download started:", cleanUrl);
+      const startTime = Date.now();
 
       try {
         await execFileAsync(YT_DLP_PATH, args, {
-          timeout: 300000,
+          timeout: 600000,
           maxBuffer: 10 * 1024 * 1024,
         });
       } catch (dlError: any) {
-        console.error("yt-dlp error:", dlError.message);
-        console.error("yt-dlp stderr:", dlError.stderr || "none");
-        return res.status(500).json({ error: `Download failed: ${dlError.stderr?.split('\n').filter((l: string) => l.startsWith('ERROR')).join('; ') || 'Unknown error'}` });
+        console.error("yt-dlp error:", dlError.stderr || dlError.message);
+        const stderrMsg = dlError.stderr || "";
+        if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
+          return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+        }
+        return res.status(500).json({ error: `Download failed: ${stderrMsg.split('\n').filter((l: string) => l.startsWith('ERROR')).join('; ') || 'Unknown error'}` });
       }
 
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`Download completed in ${elapsed}s`);
+
       const safeTitle = sanitizeFilename(title || "video");
-      const finalFilename = `${safeTitle}.${ext}`;
 
       const actualFiles = fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(fileId));
       if (actualFiles.length === 0) {
