@@ -9,6 +9,15 @@ import * as os from "node:os";
 const execFileAsync = promisify(execFile);
 
 const YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
+const COOKIES_PATH = process.env.COOKIES_PATH || path.join(process.cwd(), "cookies.txt");
+
+function getCookiesArgs(): string[] {
+  if (fs.existsSync(COOKIES_PATH)) {
+    console.log(`Using cookies from: ${COOKIES_PATH}`);
+    return ["--cookies", COOKIES_PATH];
+  }
+  return [];
+}
 
 let ffmpegAvailable: boolean | null = null;
 async function checkFfmpeg(): Promise<boolean> {
@@ -245,15 +254,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json(cached.data);
       }
 
-      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, [
+      const analyzeArgs = [
         "--dump-json",
         "--no-download",
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
-        "--extractor-args", "youtube:player_client=android,web",
+        ...getCookiesArgs(),
         cleanUrl,
-      ], { timeout: 60000, maxBuffer: 10 * 1024 * 1024 });
+      ];
+
+      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, analyzeArgs, { timeout: 60000, maxBuffer: 10 * 1024 * 1024 });
 
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
@@ -313,7 +324,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
-        "--extractor-args", "youtube:player_client=android,web",
+        ...getCookiesArgs(),
       ];
 
       let ext: string;
