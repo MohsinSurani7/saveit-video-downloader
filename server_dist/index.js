@@ -13,7 +13,6 @@ var YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonli
 var COOKIES_PATH = process.env.COOKIES_PATH || path.join(process.cwd(), "cookies.txt");
 function getCookiesArgs() {
   if (fs.existsSync(COOKIES_PATH)) {
-    console.log(`Using cookies from: ${COOKIES_PATH}`);
     return ["--cookies", COOKIES_PATH];
   }
   return [];
@@ -124,8 +123,9 @@ function parseFormats(rawFormats) {
       const existing = videoByRes.get(height);
       const isH264 = f.vcodec?.startsWith("avc") || f.vcodec?.startsWith("h264");
       const existingIsH264 = existing?.vcodec?.startsWith("avc") || existing?.vcodec?.startsWith("h264");
-      if (!existing || isH264 && !existingIsH264 || !existing && !isH264) {
-        const hasBothTracks = hasVideo && hasAudio;
+      const hasBoth = hasVideo && hasAudio;
+      const existingHasBoth = existing?.acodec !== "none";
+      if (!existing || hasBoth && !existingHasBoth || isH264 && !existingIsH264) {
         videoByRes.set(height, {
           formatId: f.format_id,
           ext: f.ext || "mp4",
@@ -229,10 +229,13 @@ async function registerRoutes(app2) {
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
+        "--no-check-formats",
+        "--socket-timeout",
+        "15",
         ...getCookiesArgs(),
         cleanUrl
       ];
-      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, analyzeArgs, { timeout: 6e4, maxBuffer: 10 * 1024 * 1024 });
+      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, analyzeArgs, { timeout: 3e4, maxBuffer: 10 * 1024 * 1024 });
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
       const videoInfo = {
@@ -255,6 +258,10 @@ async function registerRoutes(app2) {
       console.error("Analyze stderr:", error.stderr || "none");
       if (error.message?.includes("timeout")) {
         return res.status(504).json({ error: "Request timed out. The video might be unavailable." });
+      }
+      const stderrMsg = error.stderr || "";
+      if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
+        return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
       }
       return res.status(500).json({ error: "Failed to analyze video. Please check the URL and try again." });
     }
@@ -282,6 +289,12 @@ async function registerRoutes(app2) {
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
+        "--socket-timeout",
+        "15",
+        "--retries",
+        "3",
+        "--concurrent-fragments",
+        "4",
         ...getCookiesArgs()
       ];
       let ext;
@@ -302,24 +315,30 @@ async function registerRoutes(app2) {
           args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
           args.push("-f", "bv*+ba/b");
           args.push("--merge-output-format", "mp4");
+          args.push("--remux-video", "mp4");
         } else {
           args.push("-f", "best[ext=mp4]/best");
         }
       }
       args.push(cleanUrl);
-      console.log("Download args:", args.join(" "));
+      console.log("Download started:", cleanUrl);
+      const startTime = Date.now();
       try {
         await execFileAsync(YT_DLP_PATH, args, {
-          timeout: 3e5,
+          timeout: 6e5,
           maxBuffer: 10 * 1024 * 1024
         });
       } catch (dlError) {
-        console.error("yt-dlp error:", dlError.message);
-        console.error("yt-dlp stderr:", dlError.stderr || "none");
-        return res.status(500).json({ error: `Download failed: ${dlError.stderr?.split("\n").filter((l) => l.startsWith("ERROR")).join("; ") || "Unknown error"}` });
+        console.error("yt-dlp error:", dlError.stderr || dlError.message);
+        const stderrMsg = dlError.stderr || "";
+        if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
+          return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+        }
+        return res.status(500).json({ error: `Download failed: ${stderrMsg.split("\n").filter((l) => l.startsWith("ERROR")).join("; ") || "Unknown error"}` });
       }
+      const elapsed = ((Date.now() - startTime) / 1e3).toFixed(1);
+      console.log(`Download completed in ${elapsed}s`);
       const safeTitle = sanitizeFilename(title || "video");
-      const finalFilename = `${safeTitle}.${ext}`;
       const actualFiles = fs.readdirSync(TEMP_DIR).filter((f) => f.startsWith(fileId));
       if (actualFiles.length === 0) {
         return res.status(500).json({ error: "Download failed - file not created" });
