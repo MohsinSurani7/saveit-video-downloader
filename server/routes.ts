@@ -447,6 +447,64 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  app.post("/api/get-url", async (req: Request, res: Response) => {
+    try {
+      const ip = req.ip || req.socket.remoteAddress || "unknown";
+      if (!checkRateLimit(ip)) {
+        return res.status(429).json({ error: "Too many requests" });
+      }
+
+      const { url, type } = req.body;
+      if (!url || typeof url !== "string") {
+        return res.status(400).json({ error: "URL is required" });
+      }
+
+      const cleanUrl = sanitizeUrl(url);
+      if (!isValidUrl(cleanUrl)) {
+        return res.status(400).json({ error: "Invalid URL" });
+      }
+
+      if (!isAllowedHost(cleanUrl)) {
+        return res.status(400).json({ error: "Unsupported platform" });
+      }
+
+      const args = [
+        "-g",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-check-certificates",
+        "--socket-timeout", "10",
+        ...getCookiesArgs(),
+      ];
+
+      if (type === "audio") {
+        args.push("-f", "bestaudio[ext=m4a]/bestaudio");
+      } else if (req.body.formatId) {
+        args.push("-f", `${req.body.formatId}+bestaudio/best[ext=mp4]/best`);
+      } else {
+        args.push("-f", "best[ext=mp4]/best[vcodec!=none][acodec!=none]/best");
+      }
+
+      args.push(cleanUrl);
+
+      const { stdout } = await execFileAsync(YT_DLP_PATH, args, {
+        timeout: 30000,
+        maxBuffer: 5 * 1024 * 1024,
+      });
+
+      const directUrl = stdout.trim().split("\n")[0];
+
+      if (!directUrl || !directUrl.startsWith("http")) {
+        return res.status(500).json({ error: "Could not extract direct URL, using server download instead", fallback: true });
+      }
+
+      return res.json({ directUrl, method: "direct" });
+    } catch (error: any) {
+      console.error("Get-URL error:", error.stderr || error.message);
+      return res.json({ error: "Direct URL not available", fallback: true });
+    }
+  });
+
   app.get("/api/thumbnail", async (req: Request, res: Response) => {
     try {
       const { url } = req.query;
