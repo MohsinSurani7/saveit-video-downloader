@@ -10,6 +10,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 var execFileAsync = promisify(execFile);
 var YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
+var ffmpegAvailable = null;
+async function checkFfmpeg() {
+  if (ffmpegAvailable !== null) return ffmpegAvailable;
+  try {
+    await execFileAsync("ffmpeg", ["-version"], { timeout: 5e3 });
+    ffmpegAvailable = true;
+  } catch {
+    ffmpegAvailable = false;
+  }
+  console.log(`ffmpeg available: ${ffmpegAvailable}`);
+  return ffmpegAvailable;
+}
 var analysisCache = /* @__PURE__ */ new Map();
 var CACHE_TTL = 10 * 60 * 1e3;
 function isValidUrl(str) {
@@ -34,11 +46,14 @@ var ALLOWED_HOSTS = [
   "facebook.com",
   "www.facebook.com",
   "fb.watch",
+  "m.facebook.com",
   "instagram.com",
   "www.instagram.com",
   "tiktok.com",
   "www.tiktok.com",
   "vm.tiktok.com",
+  "vt.tiktok.com",
+  "t.tiktok.com",
   "twitter.com",
   "www.twitter.com",
   "x.com",
@@ -47,7 +62,20 @@ var ALLOWED_HOSTS = [
   "www.vimeo.com",
   "player.vimeo.com",
   "dailymotion.com",
-  "www.dailymotion.com"
+  "www.dailymotion.com",
+  "reddit.com",
+  "www.reddit.com",
+  "pinterest.com",
+  "www.pinterest.com",
+  "tumblr.com",
+  "www.tumblr.com",
+  "twitch.tv",
+  "www.twitch.tv",
+  "clips.twitch.tv",
+  "soundcloud.com",
+  "www.soundcloud.com",
+  "bilibili.com",
+  "www.bilibili.com"
 ];
 function isAllowedHost(urlStr) {
   try {
@@ -69,47 +97,68 @@ function detectPlatform(url) {
   if (hostname.includes("twitter.com") || hostname.includes("x.com")) return "Twitter/X";
   if (hostname.includes("vimeo.com")) return "Vimeo";
   if (hostname.includes("dailymotion.com")) return "Dailymotion";
+  if (hostname.includes("reddit.com")) return "Reddit";
+  if (hostname.includes("twitch.tv")) return "Twitch";
+  if (hostname.includes("soundcloud.com")) return "SoundCloud";
   return "Other";
 }
 function parseFormats(rawFormats) {
   if (!rawFormats) return [];
-  const seen = /* @__PURE__ */ new Set();
-  const formats = [];
+  const videoByRes = /* @__PURE__ */ new Map();
+  const audioFormats = [];
+  const seenAudioBitrate = /* @__PURE__ */ new Set();
   for (const f of rawFormats) {
-    const key = `${f.format_id}-${f.ext}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
     const hasVideo = f.vcodec && f.vcodec !== "none";
     const hasAudio = f.acodec && f.acodec !== "none";
     if (!hasVideo && !hasAudio) continue;
-    let quality = f.format_note || f.quality || "unknown";
-    let resolution = "";
     if (hasVideo && f.height) {
-      resolution = `${f.width || "?"}x${f.height}`;
-      if (!f.format_note) {
-        quality = `${f.height}p`;
+      const height = f.height;
+      const existing = videoByRes.get(height);
+      const isH264 = f.vcodec?.startsWith("avc") || f.vcodec?.startsWith("h264");
+      const existingIsH264 = existing?.vcodec?.startsWith("avc") || existing?.vcodec?.startsWith("h264");
+      if (!existing || isH264 && !existingIsH264 || !existing && !isH264) {
+        const hasBothTracks = hasVideo && hasAudio;
+        videoByRes.set(height, {
+          formatId: f.format_id,
+          ext: f.ext || "mp4",
+          quality: `${height}p`,
+          resolution: `${f.width || "?"}x${height}`,
+          filesize: f.filesize || f.filesize_approx || null,
+          vcodec: f.vcodec || "none",
+          acodec: f.acodec || "none",
+          type: "video",
+          fps: f.fps || null
+        });
       }
     } else if (!hasVideo && hasAudio) {
-      quality = f.abr ? `${Math.round(f.abr)}kbps` : "audio";
+      const bitrate = f.abr ? Math.round(f.abr) : 0;
+      if (bitrate > 0 && !seenAudioBitrate.has(bitrate)) {
+        seenAudioBitrate.add(bitrate);
+        audioFormats.push({
+          formatId: f.format_id,
+          ext: f.ext || "m4a",
+          quality: `${bitrate}kbps`,
+          resolution: "",
+          filesize: f.filesize || f.filesize_approx || null,
+          vcodec: "none",
+          acodec: f.acodec || "none",
+          type: "audio",
+          fps: null
+        });
+      }
     }
-    formats.push({
-      formatId: f.format_id,
-      ext: f.ext || "mp4",
-      quality,
-      resolution,
-      filesize: f.filesize || f.filesize_approx || null,
-      vcodec: f.vcodec || "none",
-      acodec: f.acodec || "none",
-      type: hasVideo ? "video" : "audio",
-      fps: f.fps || null
-    });
   }
-  return formats.sort((a, b) => {
-    if (a.type !== b.type) return a.type === "video" ? -1 : 1;
+  const videos = Array.from(videoByRes.values()).sort((a, b) => {
     const aH = parseInt(a.resolution.split("x")[1]) || 0;
     const bH = parseInt(b.resolution.split("x")[1]) || 0;
     return bH - aH;
   });
+  const audios = audioFormats.sort((a, b) => {
+    const aB = parseInt(a.quality) || 0;
+    const bB = parseInt(b.quality) || 0;
+    return bB - aB;
+  });
+  return [...videos, ...audios];
 }
 var requestCounts = /* @__PURE__ */ new Map();
 var RATE_LIMIT = 30;
@@ -144,6 +193,7 @@ function cleanupOldFiles() {
 }
 setInterval(cleanupOldFiles, 5 * 60 * 1e3);
 async function registerRoutes(app2) {
+  checkFfmpeg();
   app2.post("/api/analyze", async (req, res) => {
     try {
       const ip = req.ip || req.socket.remoteAddress || "unknown";
@@ -165,13 +215,16 @@ async function registerRoutes(app2) {
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         return res.json(cached.data);
       }
-      const { stdout } = await execFileAsync(YT_DLP_PATH, [
+      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, [
         "--dump-json",
         "--no-download",
         "--no-playlist",
         "--no-warnings",
+        "--no-check-certificates",
+        "--extractor-args",
+        "youtube:player_client=android,web",
         cleanUrl
-      ], { timeout: 3e4, maxBuffer: 10 * 1024 * 1024 });
+      ], { timeout: 6e4, maxBuffer: 10 * 1024 * 1024 });
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
       const videoInfo = {
@@ -191,6 +244,7 @@ async function registerRoutes(app2) {
       return res.json(videoInfo);
     } catch (error) {
       console.error("Analyze error:", error.message);
+      console.error("Analyze stderr:", error.stderr || "none");
       if (error.message?.includes("timeout")) {
         return res.status(504).json({ error: "Request timed out. The video might be unavailable." });
       }
@@ -214,28 +268,49 @@ async function registerRoutes(app2) {
       if (!isAllowedHost(cleanUrl)) {
         return res.status(400).json({ error: "Unsupported platform" });
       }
+      const hasFfmpeg = await checkFfmpeg();
       const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      const ext = type === "audio" ? "mp3" : "mp4";
-      const outputFilename = `${fileId}.${ext}`;
-      const outputPath = path.join(TEMP_DIR, outputFilename);
       const args = [
         "--no-playlist",
         "--no-warnings",
-        "-o",
-        outputPath
+        "--no-check-certificates",
+        "--extractor-args",
+        "youtube:player_client=android,web"
       ];
+      let ext;
       if (type === "audio") {
-        args.push("-f", "bestaudio", "--extract-audio", "--audio-format", "mp3");
+        ext = hasFfmpeg ? "mp3" : "m4a";
+        const outputPath = path.join(TEMP_DIR, `${fileId}.${ext}`);
+        args.push("-o", outputPath);
+        if (hasFfmpeg) {
+          args.push("-f", "bestaudio", "--extract-audio", "--audio-format", "mp3");
+        } else {
+          args.push("-f", "bestaudio[ext=m4a]/bestaudio");
+        }
       } else {
-        args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
-        args.push("-f", "bv*+ba/b");
-        args.push("--merge-output-format", "mp4");
+        ext = "mp4";
+        const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`);
+        args.push("-o", outputPath);
+        if (hasFfmpeg) {
+          args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
+          args.push("-f", "bv*+ba/b");
+          args.push("--merge-output-format", "mp4");
+        } else {
+          args.push("-f", "best[ext=mp4]/best");
+        }
       }
       args.push(cleanUrl);
-      await execFileAsync(YT_DLP_PATH, args, {
-        timeout: 3e5,
-        maxBuffer: 10 * 1024 * 1024
-      });
+      console.log("Download args:", args.join(" "));
+      try {
+        await execFileAsync(YT_DLP_PATH, args, {
+          timeout: 3e5,
+          maxBuffer: 10 * 1024 * 1024
+        });
+      } catch (dlError) {
+        console.error("yt-dlp error:", dlError.message);
+        console.error("yt-dlp stderr:", dlError.stderr || "none");
+        return res.status(500).json({ error: `Download failed: ${dlError.stderr?.split("\n").filter((l) => l.startsWith("ERROR")).join("; ") || "Unknown error"}` });
+      }
       const safeTitle = sanitizeFilename(title || "video");
       const finalFilename = `${safeTitle}.${ext}`;
       const actualFiles = fs.readdirSync(TEMP_DIR).filter((f) => f.startsWith(fileId));
@@ -243,11 +318,12 @@ async function registerRoutes(app2) {
         return res.status(500).json({ error: "Download failed - file not created" });
       }
       const actualFile = actualFiles[0];
-      const actualPath = path.join(TEMP_DIR, actualFile);
+      const actualExt = path.extname(actualFile).slice(1);
+      const correctedFilename = `${safeTitle}.${actualExt}`;
       return res.json({
         fileId: actualFile,
-        filename: finalFilename,
-        downloadPath: `/api/file/${actualFile}?name=${encodeURIComponent(finalFilename)}`
+        filename: correctedFilename,
+        downloadPath: `/api/file/${actualFile}?name=${encodeURIComponent(correctedFilename)}`
       });
     } catch (error) {
       console.error("Download error:", error.message);
@@ -268,6 +344,7 @@ async function registerRoutes(app2) {
       let contentType = "application/octet-stream";
       if (ext === ".mp4") contentType = "video/mp4";
       else if (ext === ".mp3") contentType = "audio/mpeg";
+      else if (ext === ".m4a") contentType = "audio/mp4";
       else if (ext === ".webm") contentType = "video/webm";
       res.setHeader("Content-Type", contentType);
       res.setHeader("Content-Length", stat.size);
@@ -302,6 +379,7 @@ async function registerRoutes(app2) {
         "--no-download",
         "--no-playlist",
         "--no-warnings",
+        "--no-check-certificates",
         cleanUrl
       ], { timeout: 15e3 });
       const thumbnailUrl = stdout.trim();
