@@ -120,10 +120,9 @@ export default function DownloadScreen() {
 
       const res = await apiRequest("POST", "/api/download", {
         url: videoInfo.url,
-        formatId: selectedFormat?.formatId,
         type: downloadType,
         title: videoInfo.title,
-        hasAudio: selectedFormat?.acodec !== "none" && selectedFormat?.acodec !== undefined,
+        quality: selectedFormat?.quality,
       });
       const data = (await res.json()) as {
         fileId: string;

@@ -401,7 +401,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(429).json({ error: "Too many requests" });
       }
 
-      const { url, formatId, type, title, hasAudio } = req.body;
+      const { url, formatId, type, title, quality } = req.body;
       if (!url || typeof url !== "string") {
         return res.status(400).json({ error: "URL is required" });
       }
@@ -446,20 +446,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`);
         args.push("-o", outputPath);
 
-        if (formatId) {
-          if (hasAudio) {
-            args.push("-f", `${formatId}/best[ext=mp4]/best`);
-          } else if (hasFfmpeg) {
-            args.push("-f", `${formatId}+bestaudio/${formatId}/best[ext=mp4]/best`);
+        const resHeight = quality ? parseInt(quality) : 0;
+
+        if (hasFfmpeg) {
+          if (resHeight > 0) {
+            args.push("-S", `res:${resHeight},vcodec:h264,acodec:aac,ext:mp4`);
           } else {
-            args.push("-f", `${formatId}/best[ext=mp4]/best`);
+            args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
           }
-          if (hasFfmpeg) {
-            args.push("--merge-output-format", "mp4");
-            args.push("--remux-video", "mp4");
-          }
-        } else if (hasFfmpeg) {
-          args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
           args.push("-f", "bv*+ba/b");
           args.push("--merge-output-format", "mp4");
           args.push("--remux-video", "mp4");
