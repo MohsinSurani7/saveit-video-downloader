@@ -123,6 +123,7 @@ export default function DownloadScreen() {
         formatId: selectedFormat?.formatId,
         type: downloadType,
         title: videoInfo.title,
+        hasAudio: selectedFormat?.acodec !== "none" && selectedFormat?.acodec !== undefined,
       });
       const data = (await res.json()) as {
         fileId: string;
