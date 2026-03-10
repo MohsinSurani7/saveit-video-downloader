@@ -35,4 +35,5 @@ export interface DownloadHistoryItem {
   format: string;
   timestamp: number;
   url: string;
+  localUri?: string;
 }

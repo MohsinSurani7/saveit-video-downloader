@@ -81,7 +81,20 @@ export default function DownloadScreen() {
         setDownloadState("saving");
 
         await saveToGallery(result.uri, currentFilenameRef.current);
-        await recordHistory();
+
+        if (videoInfo) {
+          await addToHistory({
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+            title: videoInfo.title,
+            thumbnail: videoInfo.thumbnail,
+            platform: videoInfo.platform,
+            quality: selectedFormat?.quality || "best",
+            format: "mp4",
+            timestamp: Date.now(),
+            url: videoInfo.url,
+            localUri: result.uri,
+          });
+        }
 
         setDownloadState("idle");
         setDownloadProgress(0);
@@ -93,7 +106,7 @@ export default function DownloadScreen() {
         Alert.alert("Error", e.message || "Resume failed");
       }
     }
-  }, [recordHistory]);
+  }, [videoInfo, selectedFormat]);
 
   const handleCancel = useCallback(() => {
     cancelledRef.current = true;
@@ -225,6 +238,7 @@ export default function DownloadScreen() {
         format: "mp4",
         timestamp: Date.now(),
         url: info.url,
+        localUri: result.uri,
       });
 
       setDownloadState("idle");

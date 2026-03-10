@@ -22,16 +22,15 @@ SaveIt is a mobile-first video downloader app built with Expo (React Native) and
 ```
 app/
   _layout.tsx          # Root layout with providers
+  player.tsx           # Full-screen VLC-style offline video player
   (tabs)/
     _layout.tsx        # Tab layout (Download + History)
-    index.tsx          # Main download screen (pause/resume/cancel, direct URL)
-    history.tsx        # Download history screen
+    index.tsx          # Main download screen (1-tap quality download)
+    history.tsx        # Download history screen (tap to play)
 components/
-  URLInput.tsx         # URL input with paste button
+  URLInput.tsx         # URL input with HD/SD/Best quality buttons
   VideoPreview.tsx     # Video thumbnail + metadata display
-  FormatSelector.tsx   # Video/Audio toggle + format chips
-  DownloadButton.tsx   # Download action button
-  HistoryItem.tsx      # History list item
+  HistoryItem.tsx      # History list item with play overlay
   ErrorBoundary.tsx    # Error boundary wrapper
   ErrorFallback.tsx    # Error fallback UI
 constants/
@@ -55,13 +54,14 @@ server/
 - `GET /api/thumbnail` - Get video thumbnail URL
 
 ## Key Features
-- URL analysis with metadata display (title, channel, duration, views)
-- Video/Audio format selection with quality options
-- **Direct URL download**: App tries to get CDN URL first (faster, uses client's internet), falls back to server-side download
+- **1-Tap Download**: Paste URL → tap HD/SD/Best → instant download (FastVid-style)
+- **Direct URL download**: Non-YouTube platforms download from CDN (zero server load)
 - **Pause/Resume/Cancel**: Download controls during active transfers
+- **Offline Video Player**: VLC-style full-screen player with play/pause, seek, speed control
+- History items tap to play downloaded videos offline
 - In-app download with progress tracking
-- Direct save to device gallery (no share sheet)
-- Download history with AsyncStorage persistence
+- Direct save to device gallery
+- Download history with AsyncStorage persistence (tracks local file paths)
 - Platform detection (Facebook, Instagram, TikTok, Twitter/X, Vimeo, Reddit, Twitch, SoundCloud, Bilibili, Pinterest, Dailymotion)
 - Rate limiting and URL validation
 - Server-side caching for repeated requests
