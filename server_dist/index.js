@@ -135,7 +135,9 @@ function parseFormats(rawFormats) {
           vcodec: f.vcodec || "none",
           acodec: f.acodec || "none",
           type: "video",
-          fps: f.fps || null
+          fps: f.fps || null,
+          url: f.url || void 0,
+          hasAudio: hasBoth
         });
       }
     } else if (!hasVideo && hasAudio) {
@@ -315,6 +317,26 @@ async function registerRoutes(app2) {
       console.log(`Analyze completed in ${elapsed}s`);
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
+      const platform = detectPlatform(cleanUrl);
+      const isYouTube = platform === "Video";
+      let directUrl;
+      let needsServerDownload = isYouTube;
+      if (!isYouTube) {
+        const combinedFormat = formats.find((f) => f.type === "video" && f.hasAudio && f.url);
+        if (combinedFormat?.url) {
+          directUrl = combinedFormat.url;
+          needsServerDownload = false;
+        } else if (rawInfo.url && rawInfo.url.startsWith("http")) {
+          directUrl = rawInfo.url;
+          needsServerDownload = false;
+        } else {
+          needsServerDownload = true;
+        }
+      }
+      const cleanFormats = formats.map((f) => {
+        const { url: _url, ...rest } = f;
+        return rest;
+      });
       const videoInfo = {
         id: rawInfo.id || "",
         title: rawInfo.title || "Unknown",
@@ -325,8 +347,10 @@ async function registerRoutes(app2) {
         viewCount: rawInfo.view_count || 0,
         uploadDate: rawInfo.upload_date || "",
         url: cleanUrl,
-        formats,
-        platform: detectPlatform(cleanUrl)
+        formats: cleanFormats,
+        platform,
+        directUrl,
+        needsServerDownload
       };
       analysisCache.set(cleanUrl, { data: videoInfo, timestamp: Date.now() });
       return res.json(videoInfo);

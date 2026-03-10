@@ -120,26 +120,13 @@ export default function DownloadScreen() {
 
       let fileUrl: string;
       let filename: string;
+      const ext = downloadType === "audio" ? "m4a" : "mp4";
+      const safeTitle = videoInfo.title.replace(/[^a-zA-Z0-9._\- ]/g, "_").slice(0, 100);
 
-      try {
-        const urlRes = await apiRequest("POST", "/api/get-url", {
-          url: videoInfo.url,
-          type: downloadType,
-          quality: selectedFormat?.quality,
-        });
-        const urlData = await urlRes.json();
-
-        if (urlData.directUrl && !urlData.fallback) {
-          fileUrl = urlData.directUrl;
-          const ext = downloadType === "audio" ? "m4a" : "mp4";
-          const safeTitle = videoInfo.title.replace(/[^a-zA-Z0-9._\- ]/g, "_").slice(0, 100);
-          filename = `${safeTitle}.${ext}`;
-        } else {
-          throw new Error("use server");
-        }
-      } catch {
-        if (cancelledRef.current) { setDownloadState("idle"); return; }
-
+      if (videoInfo.directUrl && !videoInfo.needsServerDownload && downloadType !== "audio") {
+        fileUrl = videoInfo.directUrl;
+        filename = `${safeTitle}.${ext}`;
+      } else {
         const res = await apiRequest("POST", "/api/download", {
           url: videoInfo.url,
           type: downloadType,

@@ -22,6 +22,8 @@ export interface VideoInfo {
   url: string;
   formats: VideoFormat[];
   platform: string;
+  directUrl?: string;
+  needsServerDownload?: boolean;
 }
 
 export interface DownloadHistoryItem {

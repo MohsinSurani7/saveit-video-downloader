@@ -41,6 +41,8 @@ interface VideoFormat {
   acodec: string;
   type: "video" | "audio";
   fps: number | null;
+  url?: string;
+  hasAudio?: boolean;
 }
 
 interface VideoInfo {
@@ -55,6 +57,8 @@ interface VideoInfo {
   url: string;
   formats: VideoFormat[];
   platform: string;
+  directUrl?: string;
+  needsServerDownload?: boolean;
 }
 
 const analysisCache = new Map<string, { data: VideoInfo; timestamp: number }>();
@@ -153,6 +157,8 @@ function parseFormats(rawFormats: any[]): VideoFormat[] {
           acodec: f.acodec || "none",
           type: "video",
           fps: f.fps || null,
+          url: f.url || undefined,
+          hasAudio: hasBoth,
         });
       }
     } else if (!hasVideo && hasAudio) {
@@ -363,6 +369,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
 
+      const platform = detectPlatform(cleanUrl);
+      const isYouTube = platform === "Video";
+
+      let directUrl: string | undefined;
+      let needsServerDownload = isYouTube;
+
+      if (!isYouTube) {
+        const combinedFormat = formats.find(f => f.type === "video" && f.hasAudio && f.url);
+        if (combinedFormat?.url) {
+          directUrl = combinedFormat.url;
+          needsServerDownload = false;
+        } else if (rawInfo.url && rawInfo.url.startsWith("http")) {
+          directUrl = rawInfo.url;
+          needsServerDownload = false;
+        } else {
+          needsServerDownload = true;
+        }
+      }
+
+      const cleanFormats = formats.map(f => {
+        const { url: _url, ...rest } = f;
+        return rest;
+      });
+
       const videoInfo: VideoInfo = {
         id: rawInfo.id || "",
         title: rawInfo.title || "Unknown",
@@ -373,8 +403,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         viewCount: rawInfo.view_count || 0,
         uploadDate: rawInfo.upload_date || "",
         url: cleanUrl,
-        formats,
-        platform: detectPlatform(cleanUrl),
+        formats: cleanFormats,
+        platform,
+        directUrl,
+        needsServerDownload,
       };
 
       analysisCache.set(cleanUrl, { data: videoInfo, timestamp: Date.now() });
