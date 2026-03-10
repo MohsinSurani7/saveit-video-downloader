@@ -118,23 +118,46 @@ export default function DownloadScreen() {
 
       if (cancelledRef.current) { setDownloadState("idle"); return; }
 
-      const res = await apiRequest("POST", "/api/download", {
-        url: videoInfo.url,
-        type: downloadType,
-        title: videoInfo.title,
-        quality: selectedFormat?.quality,
-      });
-      const data = (await res.json()) as {
-        fileId: string;
-        filename: string;
-        downloadPath: string;
-      };
+      let fileUrl: string;
+      let filename: string;
+
+      try {
+        const urlRes = await apiRequest("POST", "/api/get-url", {
+          url: videoInfo.url,
+          type: downloadType,
+          quality: selectedFormat?.quality,
+        });
+        const urlData = await urlRes.json();
+
+        if (urlData.directUrl && !urlData.fallback) {
+          fileUrl = urlData.directUrl;
+          const ext = downloadType === "audio" ? "m4a" : "mp4";
+          const safeTitle = videoInfo.title.replace(/[^a-zA-Z0-9._\- ]/g, "_").slice(0, 100);
+          filename = `${safeTitle}.${ext}`;
+        } else {
+          throw new Error("use server");
+        }
+      } catch {
+        if (cancelledRef.current) { setDownloadState("idle"); return; }
+
+        const res = await apiRequest("POST", "/api/download", {
+          url: videoInfo.url,
+          type: downloadType,
+          title: videoInfo.title,
+          quality: selectedFormat?.quality,
+        });
+        const data = (await res.json()) as {
+          fileId: string;
+          filename: string;
+          downloadPath: string;
+        };
+        const baseUrl = getApiUrl();
+        fileUrl = new URL(data.downloadPath, baseUrl).toString();
+        filename = data.filename;
+      }
 
       if (cancelledRef.current) { setDownloadState("idle"); return; }
 
-      const baseUrl = getApiUrl();
-      const fileUrl = new URL(data.downloadPath, baseUrl).toString();
-      const filename = data.filename;
       const localUri = FileSystem.documentDirectory + filename;
       currentFilenameRef.current = filename;
 

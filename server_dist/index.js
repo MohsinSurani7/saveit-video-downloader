@@ -485,7 +485,7 @@ async function registerRoutes(app2) {
       if (!checkRateLimit(ip)) {
         return res.status(429).json({ error: "Too many requests" });
       }
-      const { url, type } = req.body;
+      const { url, type, quality } = req.body;
       if (!url || typeof url !== "string") {
         return res.status(400).json({ error: "URL is required" });
       }
@@ -496,6 +496,11 @@ async function registerRoutes(app2) {
       if (!isAllowedHost(cleanUrl)) {
         return res.status(400).json({ error: "Unsupported platform" });
       }
+      const platform = detectPlatform(cleanUrl);
+      const needsServerMerge = platform === "Video" || type === "audio";
+      if (needsServerMerge) {
+        return res.json({ error: "Platform requires server-side processing", fallback: true });
+      }
       const args = [
         "-g",
         "--no-playlist",
@@ -503,22 +508,20 @@ async function registerRoutes(app2) {
         "--no-check-certificates",
         "--socket-timeout",
         "10",
-        ...getCookiesArgs()
+        ...getCookiesArgs(),
+        "-f",
+        "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
+        cleanUrl
       ];
-      if (type === "audio") {
-        args.push("-f", "bestaudio[ext=m4a]/bestaudio");
-      } else if (req.body.formatId) {
-        args.push("-f", `${req.body.formatId}+bestaudio/best[ext=mp4]/best`);
-      } else {
-        args.push("-f", "best[ext=mp4]/best[vcodec!=none][acodec!=none]/best");
-      }
-      args.push(cleanUrl);
       const stdout = await analyzeWithTimeout(args, 2e4);
-      const directUrl = stdout.trim().split("\n")[0];
-      if (!directUrl || !directUrl.startsWith("http")) {
+      const urls = stdout.trim().split("\n").filter((u) => u.startsWith("http"));
+      if (urls.length === 0) {
         return res.json({ error: "Direct URL not available", fallback: true });
       }
-      return res.json({ directUrl, method: "direct" });
+      if (urls.length === 1) {
+        return res.json({ directUrl: urls[0], method: "direct" });
+      }
+      return res.json({ error: "Multiple streams detected, requires server merge", fallback: true });
     } catch (error) {
       console.error("Get-URL error:", error.stderr || error.message);
       return res.json({ error: "Direct URL not available", fallback: true });
