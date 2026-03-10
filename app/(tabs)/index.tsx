@@ -353,7 +353,7 @@ export default function DownloadScreen() {
               Paste a video link to get started
             </Text>
             <Text style={[styles.emptyDesc, { color: theme.textSecondary }]}>
-              Supports Facebook, Instagram, TikTok, Twitter, Vimeo, and more
+              Supports Facebook, Instagram, Twitter, Vimeo, Reddit, and more
             </Text>
           </View>
         )}

@@ -62,7 +62,8 @@ server/
 - In-app download with progress tracking
 - Direct save to device gallery
 - Download history with AsyncStorage persistence (tracks local file paths)
-- Platform detection (Facebook, Instagram, TikTok, Twitter/X, Vimeo, Reddit, Twitch, SoundCloud, Bilibili, Pinterest, Dailymotion)
+- Platform detection (Facebook, Instagram, Twitter/X, Vimeo, Reddit, Twitch, SoundCloud, Bilibili, Pinterest, Dailymotion)
+- Proxy rotation fallback for blocked platforms (SOCKS5 + HTTP)
 - Rate limiting and URL validation
 - Server-side caching for repeated requests
 - Dark/light mode support

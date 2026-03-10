@@ -32,14 +32,94 @@ var import_node_util = require("node:util");
 var path = __toESM(require("node:path"));
 var fs = __toESM(require("node:fs"));
 var os = __toESM(require("node:os"));
+var https = __toESM(require("node:https"));
+var http = __toESM(require("node:http"));
 var execFileAsync = (0, import_node_util.promisify)(import_node_child_process.execFile);
 var YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
 var COOKIES_PATH = process.env.COOKIES_PATH || path.join(process.cwd(), "cookies.txt");
+var CUSTOM_PROXY = process.env.PROXY_URL || "";
 function getCookiesArgs() {
   if (fs.existsSync(COOKIES_PATH)) {
     return ["--cookies", COOKIES_PATH];
   }
   return [];
+}
+var proxyList = [];
+var proxyLastFetch = 0;
+var PROXY_CACHE_TTL = 30 * 60 * 1e3;
+var proxyIndex = 0;
+async function httpGet(url) {
+  return new Promise((resolve2, reject) => {
+    const mod = url.startsWith("https") ? https : http;
+    const req = mod.get(url, { timeout: 1e4 }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk.toString();
+      });
+      res.on("end", () => resolve2(data));
+    });
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("timeout"));
+    });
+  });
+}
+async function fetchProxies() {
+  const now = Date.now();
+  if (proxyList.length > 0 && now - proxyLastFetch < PROXY_CACHE_TTL) {
+    return proxyList;
+  }
+  if (CUSTOM_PROXY) {
+    proxyList = [CUSTOM_PROXY];
+    proxyLastFetch = now;
+    console.log("Using custom proxy:", CUSTOM_PROXY);
+    return proxyList;
+  }
+  const sources = [
+    { url: "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all&ssl=all&anonymity=all", type: "socks5" },
+    { url: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt", type: "socks5" },
+    { url: "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", type: "socks5" },
+    { url: "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=elite", type: "http" },
+    { url: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", type: "http" },
+    { url: "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", type: "http" }
+  ];
+  const allProxies = [];
+  for (const source of sources) {
+    try {
+      const data = await httpGet(source.url);
+      const proxies = data.split("\n").map((p) => p.trim()).filter((p) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(p)).map((p) => source.type === "socks5" ? `socks5://${p}` : `http://${p}`);
+      allProxies.push(...proxies);
+    } catch (err) {
+      console.log(`Proxy source failed: ${err.message}`);
+    }
+  }
+  const unique = [...new Set(allProxies)];
+  const socks5 = unique.filter((p) => p.startsWith("socks5://"));
+  const httpProxies = unique.filter((p) => p.startsWith("http://"));
+  const shuffled = [
+    ...socks5.sort(() => Math.random() - 0.5),
+    ...httpProxies.sort(() => Math.random() - 0.5)
+  ].slice(0, 200);
+  if (shuffled.length > 0) {
+    proxyList = shuffled;
+    proxyLastFetch = now;
+    proxyIndex = 0;
+    console.log(`Fetched ${shuffled.length} proxies`);
+  } else {
+    console.log("No proxies fetched, will try direct");
+  }
+  return proxyList;
+}
+function getNextProxy() {
+  if (proxyList.length === 0) return null;
+  const proxy = proxyList[proxyIndex % proxyList.length];
+  proxyIndex++;
+  return proxy;
+}
+function markProxyBad(proxyUrl) {
+  proxyList = proxyList.filter((p) => p !== proxyUrl);
+  console.log(`Removed bad proxy, ${proxyList.length} remaining`);
 }
 var ffmpegAvailable = null;
 async function checkFfmpeg() {
@@ -80,11 +160,6 @@ var ALLOWED_HOSTS = [
   "m.facebook.com",
   "instagram.com",
   "www.instagram.com",
-  "tiktok.com",
-  "www.tiktok.com",
-  "vm.tiktok.com",
-  "vt.tiktok.com",
-  "t.tiktok.com",
   "twitter.com",
   "www.twitter.com",
   "x.com",
@@ -295,11 +370,33 @@ function downloadWithSpawn(args, timeoutMs) {
 }
 async function registerRoutes(app2) {
   checkFfmpeg();
+  fetchProxies().catch(() => {
+  });
   app2.get("/api/health", (_req, res) => {
-    res.json({ status: "ok", timestamp: Date.now() });
+    res.json({ status: "ok", timestamp: Date.now(), proxies: proxyList.length });
   });
   app2.post("/api/analyze", async (req, res) => {
     try {
+      let buildAnalyzeArgs2 = function(proxyUrl) {
+        return [
+          "--dump-json",
+          "--no-download",
+          "--no-playlist",
+          "--no-warnings",
+          "--no-check-certificates",
+          "--no-check-formats",
+          "--skip-download",
+          "--socket-timeout",
+          "15",
+          "--retries",
+          "2",
+          ...needsImpersonate ? ["--impersonate", "Chrome"] : [],
+          ...proxyUrl ? ["--proxy", proxyUrl] : [],
+          ...getCookiesArgs(),
+          cleanUrl
+        ];
+      };
+      var buildAnalyzeArgs = buildAnalyzeArgs2;
       const ip = req.ip || req.socket.remoteAddress || "unknown";
       if (!checkRateLimit(ip)) {
         return res.status(429).json({ error: "Too many requests. Please try again later." });
@@ -313,42 +410,47 @@ async function registerRoutes(app2) {
         return res.status(400).json({ error: "Invalid URL provided" });
       }
       if (!isAllowedHost(cleanUrl)) {
-        return res.status(400).json({ error: "Unsupported platform. Supported: Facebook, Instagram, TikTok, Twitter/X, Vimeo, Dailymotion, and more" });
+        return res.status(400).json({ error: "Unsupported platform. Supported: YouTube, Facebook, Instagram, Twitter/X, Vimeo, Dailymotion, Reddit, and more" });
       }
       const cached = analysisCache.get(cleanUrl);
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         return res.json(cached.data);
       }
       const platform = detectPlatform(cleanUrl);
-      const needsImpersonate = ["TikTok", "Instagram", "Twitter/X"].includes(platform);
-      const analyzeArgs = [
-        "--dump-json",
-        "--no-download",
-        "--no-playlist",
-        "--no-warnings",
-        "--no-check-certificates",
-        "--no-check-formats",
-        "--skip-download",
-        "--socket-timeout",
-        "15",
-        "--retries",
-        "3",
-        ...needsImpersonate ? ["--impersonate", "Chrome"] : [],
-        ...getCookiesArgs(),
-        cleanUrl
-      ];
+      const needsImpersonate = ["Instagram", "Twitter/X"].includes(platform);
+      const platformNeedsProxy = false;
       console.log("Analyzing:", cleanUrl, `(platform: ${platform}, impersonate: ${needsImpersonate})`);
       const startTime = Date.now();
       let stdout;
       try {
-        stdout = await analyzeWithTimeout(analyzeArgs, 6e4);
-      } catch (firstErr) {
-        if (needsImpersonate && firstErr.stderr?.includes("blocked")) {
-          console.log("First attempt blocked, retrying with Safari impersonation...");
-          const retryArgs = analyzeArgs.map((a) => a === "Chrome" ? "Safari" : a);
-          stdout = await analyzeWithTimeout(retryArgs, 6e4);
+        stdout = await analyzeWithTimeout(buildAnalyzeArgs2(), 45e3);
+      } catch (directErr) {
+        const errMsg = (directErr.stderr || "").toLowerCase();
+        const isBlocked = errMsg.includes("blocked") || errMsg.includes("forbidden") || errMsg.includes("403") || errMsg.includes("rate-limit");
+        if (isBlocked || platformNeedsProxy) {
+          console.log(`Direct access failed for ${platform}, trying with proxies...`);
+          await fetchProxies();
+          let proxySuccess = false;
+          const maxProxyTries = Math.min(8, proxyList.length);
+          for (let i = 0; i < maxProxyTries; i++) {
+            const proxyUrl = getNextProxy();
+            if (!proxyUrl) break;
+            try {
+              console.log(`Proxy attempt ${i + 1}/${maxProxyTries}: ${proxyUrl}`);
+              stdout = await analyzeWithTimeout(buildAnalyzeArgs2(proxyUrl), 3e4);
+              console.log(`Proxy ${proxyUrl} worked!`);
+              proxySuccess = true;
+              break;
+            } catch (proxyErr) {
+              console.log(`Proxy ${proxyUrl} failed: ${(proxyErr.message || "").slice(0, 80)}`);
+              markProxyBad(proxyUrl);
+            }
+          }
+          if (!proxySuccess) {
+            throw directErr;
+          }
         } else {
-          throw firstErr;
+          throw directErr;
         }
       }
       const elapsed = ((Date.now() - startTime) / 1e3).toFixed(1);
@@ -450,7 +552,17 @@ async function registerRoutes(app2) {
         const hasFfmpeg = await checkFfmpeg();
         const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
         const dlPlatform = detectPlatform(cleanUrl);
-        const dlNeedsImpersonate = ["TikTok", "Instagram", "Twitter/X"].includes(dlPlatform);
+        const dlNeedsImpersonate = ["Instagram", "Twitter/X"].includes(dlPlatform);
+        const dlNeedsProxy = false;
+        let dlProxyArgs = [];
+        if (dlNeedsProxy) {
+          await fetchProxies();
+          const proxy = getNextProxy();
+          if (proxy) {
+            dlProxyArgs = ["--proxy", proxy];
+            console.log(`Download using proxy: ${proxy}`);
+          }
+        }
         const args = [
           "--no-playlist",
           "--no-warnings",
@@ -464,6 +576,7 @@ async function registerRoutes(app2) {
           "--buffer-size",
           "16K",
           ...dlNeedsImpersonate ? ["--impersonate", "Chrome"] : [],
+          ...dlProxyArgs,
           ...getCookiesArgs()
         ];
         let ext;
