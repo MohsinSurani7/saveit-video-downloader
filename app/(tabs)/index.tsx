@@ -127,12 +127,17 @@ export default function DownloadScreen() {
         fileUrl = videoInfo.directUrl;
         filename = `${safeTitle}.${ext}`;
       } else {
+        setDownloadState("preparing");
         const res = await apiRequest("POST", "/api/download", {
           url: videoInfo.url,
           type: downloadType,
           title: videoInfo.title,
           quality: selectedFormat?.quality,
         });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({ error: "Download failed" }));
+          throw new Error(errData.error || "Download failed");
+        }
         const data = (await res.json()) as {
           fileId: string;
           filename: string;

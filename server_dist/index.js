@@ -321,16 +321,25 @@ async function registerRoutes(app2) {
       const isYouTube = platform === "Video";
       let directUrl;
       let needsServerDownload = isYouTube;
-      if (!isYouTube) {
-        const combinedFormat = formats.find((f) => f.type === "video" && f.hasAudio && f.url);
-        if (combinedFormat?.url) {
-          directUrl = combinedFormat.url;
+      if (!isYouTube && rawInfo.formats && Array.isArray(rawInfo.formats)) {
+        const combinedFormats = rawInfo.formats.filter((f) => {
+          const hasVideo = f.vcodec && f.vcodec !== "none";
+          const hasAudio = f.acodec && f.acodec !== "none";
+          const hasUrl = f.url && f.url.startsWith("http");
+          return hasVideo && hasAudio && hasUrl;
+        }).sort((a, b) => (b.height || 0) - (a.height || 0));
+        if (combinedFormats.length > 0) {
+          const best = combinedFormats.find((f) => f.ext === "mp4" || f.vcodec?.startsWith("avc")) || combinedFormats[0];
+          directUrl = best.url;
           needsServerDownload = false;
+          console.log(`Direct URL found: ${best.format_id} ${best.height}p ${best.ext} (has audio: true)`);
         } else if (rawInfo.url && rawInfo.url.startsWith("http")) {
           directUrl = rawInfo.url;
           needsServerDownload = false;
+          console.log(`Using rawInfo.url as direct URL`);
         } else {
           needsServerDownload = true;
+          console.log(`No direct URL found for ${platform}, will use server download`);
         }
       }
       const cleanFormats = formats.map((f) => {
@@ -367,72 +376,79 @@ async function registerRoutes(app2) {
       return res.status(500).json({ error: "Failed to analyze video. Please check the URL and try again." });
     }
   });
+  let activeDownloads = 0;
+  const MAX_CONCURRENT_DOWNLOADS = 2;
   app2.post("/api/download", async (req, res) => {
     try {
       const ip = req.ip || req.socket.remoteAddress || "unknown";
       if (!checkRateLimit(ip)) {
         return res.status(429).json({ error: "Too many requests" });
       }
-      const { url, formatId, type, title, quality } = req.body;
-      if (!url || typeof url !== "string") {
-        return res.status(400).json({ error: "URL is required" });
+      if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
+        return res.status(503).json({ error: "Server is busy processing other downloads. Please try again in a minute." });
       }
-      const cleanUrl = sanitizeUrl(url);
-      if (!isValidUrl(cleanUrl)) {
-        return res.status(400).json({ error: "Invalid URL" });
-      }
-      if (!isAllowedHost(cleanUrl)) {
-        return res.status(400).json({ error: "Unsupported platform" });
-      }
-      const hasFfmpeg = await checkFfmpeg();
-      const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      const args = [
-        "--no-playlist",
-        "--no-warnings",
-        "--no-check-certificates",
-        "--socket-timeout",
-        "15",
-        "--retries",
-        "3",
-        "--concurrent-fragments",
-        "4",
-        "--buffer-size",
-        "16K",
-        ...getCookiesArgs()
-      ];
-      let ext;
-      if (type === "audio") {
-        ext = hasFfmpeg ? "mp3" : "m4a";
-        const outputPath = path.join(TEMP_DIR, `${fileId}.${ext}`);
-        args.push("-o", outputPath);
-        if (hasFfmpeg) {
-          args.push("-f", "bestaudio", "--extract-audio", "--audio-format", "mp3");
-        } else {
-          args.push("-f", "bestaudio[ext=m4a]/bestaudio");
-        }
-      } else {
-        ext = "mp4";
-        const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`);
-        args.push("-o", outputPath);
-        const resHeight = quality ? parseInt(quality) : 0;
-        if (hasFfmpeg) {
-          if (resHeight > 0) {
-            args.push("-S", `res:${resHeight},vcodec:h264,acodec:aac,ext:mp4`);
-          } else {
-            args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
-          }
-          args.push("-f", "bv*+ba/b");
-          args.push("--merge-output-format", "mp4");
-          args.push("--remux-video", "mp4");
-        } else {
-          args.push("-f", "best[ext=mp4]/best");
-        }
-      }
-      args.push(cleanUrl);
-      console.log("Download started:", cleanUrl);
-      const startTime = Date.now();
-      const downloadTimeout = 30 * 60 * 1e3;
+      activeDownloads++;
+      console.log(`Active downloads: ${activeDownloads}/${MAX_CONCURRENT_DOWNLOADS}`);
       try {
+        const { url, formatId, type, title, quality } = req.body;
+        if (!url || typeof url !== "string") {
+          return res.status(400).json({ error: "URL is required" });
+        }
+        const cleanUrl = sanitizeUrl(url);
+        if (!isValidUrl(cleanUrl)) {
+          return res.status(400).json({ error: "Invalid URL" });
+        }
+        if (!isAllowedHost(cleanUrl)) {
+          return res.status(400).json({ error: "Unsupported platform" });
+        }
+        const hasFfmpeg = await checkFfmpeg();
+        const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const args = [
+          "--no-playlist",
+          "--no-warnings",
+          "--no-check-certificates",
+          "--socket-timeout",
+          "15",
+          "--retries",
+          "3",
+          "--concurrent-fragments",
+          "4",
+          "--buffer-size",
+          "16K",
+          ...getCookiesArgs()
+        ];
+        let ext;
+        if (type === "audio") {
+          ext = hasFfmpeg ? "mp3" : "m4a";
+          const outputPath = path.join(TEMP_DIR, `${fileId}.${ext}`);
+          args.push("-o", outputPath);
+          if (hasFfmpeg) {
+            args.push("-f", "bestaudio", "--extract-audio", "--audio-format", "mp3");
+          } else {
+            args.push("-f", "bestaudio[ext=m4a]/bestaudio");
+          }
+        } else {
+          ext = "mp4";
+          const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`);
+          args.push("-o", outputPath);
+          const resHeight = quality ? parseInt(quality) : 0;
+          if (hasFfmpeg) {
+            if (resHeight > 0) {
+              args.push("-S", `res:${resHeight},vcodec:h264,acodec:aac,ext:mp4`);
+            } else {
+              args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
+            }
+            args.push("-f", "bv*+ba/b");
+            args.push("--merge-output-format", "mp4");
+            args.push("--remux-video", "mp4");
+          } else {
+            args.push("-f", "best[ext=mp4]/best");
+          }
+        }
+        args.push(cleanUrl);
+        console.log("Download started:", cleanUrl);
+        const startTime = Date.now();
+        const downloadTimeout = 30 * 60 * 1e3;
         const result = await downloadWithSpawn(args, downloadTimeout);
         if (result.code !== 0) {
           console.error("yt-dlp error:", result.stderr);
@@ -442,31 +458,33 @@ async function registerRoutes(app2) {
           }
           return res.status(500).json({ error: `Download failed: ${stderrMsg.split("\n").filter((l) => l.startsWith("ERROR")).join("; ") || "Unknown error"}` });
         }
-      } catch (dlError) {
-        console.error("Download error:", dlError.message);
-        if (dlError.message?.includes("timed out")) {
+        const elapsed = ((Date.now() - startTime) / 1e3).toFixed(1);
+        console.log(`Download completed in ${elapsed}s`);
+        const safeTitle = sanitizeFilename(title || "video");
+        const actualFiles = fs.readdirSync(TEMP_DIR).filter((f) => f.startsWith(fileId));
+        if (actualFiles.length === 0) {
+          return res.status(500).json({ error: "Download failed - file not created" });
+        }
+        const actualFile = actualFiles[0];
+        const actualExt = path.extname(actualFile).slice(1);
+        const correctedFilename = `${safeTitle}.${actualExt}`;
+        return res.json({
+          fileId: actualFile,
+          filename: correctedFilename,
+          downloadPath: `/api/file/${actualFile}?name=${encodeURIComponent(correctedFilename)}`
+        });
+      } catch (error) {
+        console.error("Download error:", error.message);
+        if (error.message?.includes("timed out")) {
           return res.status(504).json({ error: "Download timed out. Video might be too long or slow." });
         }
-        return res.status(500).json({ error: "Download failed. Please try again." });
+        return res.status(500).json({ error: "Failed to download video. Please try again." });
+      } finally {
+        activeDownloads--;
+        console.log(`Download slot freed. Active: ${activeDownloads}/${MAX_CONCURRENT_DOWNLOADS}`);
       }
-      const elapsed = ((Date.now() - startTime) / 1e3).toFixed(1);
-      console.log(`Download completed in ${elapsed}s`);
-      const safeTitle = sanitizeFilename(title || "video");
-      const actualFiles = fs.readdirSync(TEMP_DIR).filter((f) => f.startsWith(fileId));
-      if (actualFiles.length === 0) {
-        return res.status(500).json({ error: "Download failed - file not created" });
-      }
-      const actualFile = actualFiles[0];
-      const actualExt = path.extname(actualFile).slice(1);
-      const correctedFilename = `${safeTitle}.${actualExt}`;
-      return res.json({
-        fileId: actualFile,
-        filename: correctedFilename,
-        downloadPath: `/api/file/${actualFile}?name=${encodeURIComponent(correctedFilename)}`
-      });
-    } catch (error) {
-      console.error("Download error:", error.message);
-      return res.status(500).json({ error: "Failed to download video. Please try again." });
+    } catch (outerError) {
+      return res.status(500).json({ error: "Server error" });
     }
   });
   app2.get("/api/file/:fileId", (req, res) => {
