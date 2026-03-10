@@ -260,10 +260,141 @@ export default function DownloadScreen() {
     setDownloadProgress(0);
   }, []);
 
+  const [quickDownloading, setQuickDownloading] = useState(false);
+
   const handleAnalyze = useCallback((url: string) => {
     setVideoInfo(null);
     setSelectedFormat(null);
     analyzeMutation.mutate(url);
+  }, []);
+
+  const handleQuickDownload = useCallback(async (url: string) => {
+    setQuickDownloading(true);
+    setVideoInfo(null);
+    setSelectedFormat(null);
+    setDownloadProgress(0);
+    pausedRef.current = false;
+    cancelledRef.current = false;
+
+    try {
+      setDownloadState("preparing");
+
+      const analyzeRes = await apiRequest("POST", "/api/analyze", { url });
+      const info = (await analyzeRes.json()) as VideoInfo;
+      setVideoInfo(info);
+
+      const firstVideo = info.formats.find((f) => f.type === "video");
+      if (firstVideo) setSelectedFormat(firstVideo);
+
+      if (cancelledRef.current) { setDownloadState("idle"); setQuickDownloading(false); return; }
+
+      let fileUrl: string;
+      let filename: string;
+      const safeTitle = info.title.replace(/[^a-zA-Z0-9._\- ]/g, "_").slice(0, 100);
+
+      if (Platform.OS === "web") {
+        const res = await apiRequest("POST", "/api/download", {
+          url: info.url,
+          type: "video",
+          title: info.title,
+          quality: firstVideo?.quality,
+        });
+        const data = (await res.json()) as { fileId: string; filename: string; downloadPath: string };
+        const baseUrl = getApiUrl();
+        const dlUrl = new URL(data.downloadPath, baseUrl).toString();
+        const link = document.createElement("a");
+        link.href = dlUrl;
+        link.download = data.filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setDownloadState("idle");
+        setQuickDownloading(false);
+        return;
+      }
+
+      if (info.directUrl && !info.needsServerDownload) {
+        fileUrl = info.directUrl;
+        filename = `${safeTitle}.mp4`;
+      } else {
+        const res = await apiRequest("POST", "/api/download", {
+          url: info.url,
+          type: "video",
+          title: info.title,
+          quality: firstVideo?.quality,
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({ error: "Download failed" }));
+          throw new Error(errData.error || "Download failed");
+        }
+        const data = (await res.json()) as { fileId: string; filename: string; downloadPath: string };
+        const baseUrl = getApiUrl();
+        fileUrl = new URL(data.downloadPath, baseUrl).toString();
+        filename = data.filename;
+      }
+
+      if (cancelledRef.current) { setDownloadState("idle"); setQuickDownloading(false); return; }
+
+      const localUri = FileSystem.documentDirectory + filename;
+      currentFilenameRef.current = filename;
+      setDownloadState("downloading");
+
+      const downloadResumable = FileSystem.createDownloadResumable(
+        fileUrl,
+        localUri,
+        {},
+        (progress) => {
+          if (progress.totalBytesExpectedToWrite > 0) {
+            const pct = progress.totalBytesWritten / progress.totalBytesExpectedToWrite;
+            setDownloadProgress(Math.round(pct * 100));
+          }
+        }
+      );
+
+      downloadResumableRef.current = downloadResumable;
+
+      let result;
+      try {
+        result = await downloadResumable.downloadAsync();
+      } catch (e: any) {
+        if (pausedRef.current || cancelledRef.current) { setQuickDownloading(false); return; }
+        throw e;
+      }
+
+      if (pausedRef.current) { setQuickDownloading(false); return; }
+      if (cancelledRef.current) { setDownloadState("idle"); setQuickDownloading(false); return; }
+
+      if (!result?.uri) throw new Error("Download failed - no file received");
+
+      downloadResumableRef.current = null;
+      setDownloadState("saving");
+
+      await saveToGallery(result.uri, filename);
+
+      if (info) {
+        await addToHistory({
+          id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+          title: info.title,
+          thumbnail: info.thumbnail,
+          platform: info.platform,
+          quality: firstVideo?.quality || "best",
+          format: "mp4",
+          timestamp: Date.now(),
+          url: info.url,
+        });
+      }
+
+      setDownloadState("idle");
+      setDownloadProgress(0);
+    } catch (error: any) {
+      if (pausedRef.current || cancelledRef.current) { setQuickDownloading(false); return; }
+      downloadResumableRef.current = null;
+      setDownloadState("idle");
+      setDownloadProgress(0);
+      Alert.alert("Error", error.message || "Quick download failed");
+    } finally {
+      setQuickDownloading(false);
+    }
   }, []);
 
   const handleTypeChange = useCallback(
@@ -308,7 +439,12 @@ export default function DownloadScreen() {
           </Text>
         </View>
 
-        <URLInput onSubmit={handleAnalyze} isLoading={analyzeMutation.isPending} />
+        <URLInput
+          onSubmit={handleAnalyze}
+          onQuickDownload={handleQuickDownload}
+          isLoading={analyzeMutation.isPending}
+          isQuickDownloading={quickDownloading}
+        />
 
         {analyzeMutation.isPending && (
           <View style={[styles.loadingCard, { backgroundColor: theme.surface, borderColor: theme.border }]}>
@@ -321,6 +457,38 @@ export default function DownloadScreen() {
             <View style={styles.shimmerRow}>
               <View style={[styles.shimmerBlock, styles.shimmerMeta, { backgroundColor: theme.surfaceSecondary }]} />
             </View>
+          </View>
+        )}
+
+        {isDownloading && !videoInfo && (
+          <View style={styles.progressContainer}>
+            <View
+              style={[
+                styles.progressBarBg,
+                { backgroundColor: theme.surfaceSecondary },
+              ]}
+            >
+              <View
+                style={[
+                  styles.progressBarFill,
+                  {
+                    backgroundColor: downloadState === "paused" ? theme.warning : theme.success,
+                    width: `${downloadProgress}%` as any,
+                  },
+                ]}
+              />
+            </View>
+            <Text style={[styles.progressText, { color: theme.textSecondary }]}>
+              {getStatusText()}
+            </Text>
+            {(downloadState === "downloading" || downloadState === "paused" || downloadState === "preparing") && (
+              <View style={styles.controlRow}>
+                <Pressable onPress={handleCancel} style={[styles.controlBtn, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+                  <Ionicons name="close" size={20} color={theme.error} />
+                  <Text style={[styles.controlText, { color: theme.error }]}>Cancel</Text>
+                </Pressable>
+              </View>
+            )}
           </View>
         )}
 
