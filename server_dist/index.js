@@ -1,14 +1,38 @@
+"use strict";
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
+
 // server/index.ts
-import express from "express";
+var import_express = __toESM(require("express"));
 
 // server/routes.ts
-import { createServer } from "node:http";
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
-import * as path from "node:path";
-import * as fs from "node:fs";
-import * as os from "node:os";
-var execFileAsync = promisify(execFile);
+var import_node_http = require("node:http");
+var import_node_child_process = require("node:child_process");
+var import_node_util = require("node:util");
+var path = __toESM(require("node:path"));
+var fs = __toESM(require("node:fs"));
+var os = __toESM(require("node:os"));
+var execFileAsync = (0, import_node_util.promisify)(import_node_child_process.execFile);
 var YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
 var COOKIES_PATH = process.env.COOKIES_PATH || path.join(process.cwd(), "cookies.txt");
 function getCookiesArgs() {
@@ -204,7 +228,7 @@ function cleanupOldFiles() {
 setInterval(cleanupOldFiles, 5 * 60 * 1e3);
 function analyzeWithTimeout(args, timeoutMs) {
   return new Promise((resolve2, reject) => {
-    const proc = spawn(YT_DLP_PATH, args, {
+    const proc = (0, import_node_child_process.spawn)(YT_DLP_PATH, args, {
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
@@ -240,7 +264,7 @@ function analyzeWithTimeout(args, timeoutMs) {
 }
 function downloadWithSpawn(args, timeoutMs) {
   return new Promise((resolve2, reject) => {
-    const proc = spawn(YT_DLP_PATH, args, {
+    const proc = (0, import_node_child_process.spawn)(YT_DLP_PATH, args, {
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stderr = "";
@@ -295,6 +319,8 @@ async function registerRoutes(app2) {
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         return res.json(cached.data);
       }
+      const platform = detectPlatform(cleanUrl);
+      const needsImpersonate = ["TikTok", "Instagram", "Twitter/X"].includes(platform);
       const analyzeArgs = [
         "--dump-json",
         "--no-download",
@@ -304,20 +330,31 @@ async function registerRoutes(app2) {
         "--no-check-formats",
         "--skip-download",
         "--socket-timeout",
-        "10",
+        "15",
         "--retries",
-        "2",
+        "3",
+        ...needsImpersonate ? ["--impersonate", "Chrome"] : [],
         ...getCookiesArgs(),
         cleanUrl
       ];
-      console.log("Analyzing:", cleanUrl);
+      console.log("Analyzing:", cleanUrl, `(platform: ${platform}, impersonate: ${needsImpersonate})`);
       const startTime = Date.now();
-      const stdout = await analyzeWithTimeout(analyzeArgs, 45e3);
+      let stdout;
+      try {
+        stdout = await analyzeWithTimeout(analyzeArgs, 6e4);
+      } catch (firstErr) {
+        if (needsImpersonate && firstErr.stderr?.includes("blocked")) {
+          console.log("First attempt blocked, retrying with Safari impersonation...");
+          const retryArgs = analyzeArgs.map((a) => a === "Chrome" ? "Safari" : a);
+          stdout = await analyzeWithTimeout(retryArgs, 6e4);
+        } else {
+          throw firstErr;
+        }
+      }
       const elapsed = ((Date.now() - startTime) / 1e3).toFixed(1);
       console.log(`Analyze completed in ${elapsed}s`);
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
-      const platform = detectPlatform(cleanUrl);
       const isYouTube = platform === "Video";
       let directUrl;
       let needsServerDownload = isYouTube;
@@ -369,9 +406,18 @@ async function registerRoutes(app2) {
       if (error.message?.includes("timeout")) {
         return res.status(504).json({ error: "Analysis timed out. Try a shorter video or different URL." });
       }
-      const stderrMsg = error.stderr || "";
-      if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
-        return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+      const stderrMsg = (error.stderr || "").toLowerCase();
+      if (stderrMsg.includes("login required") || stderrMsg.includes("sign in") || stderrMsg.includes("authentication")) {
+        return res.status(403).json({ error: "This platform requires login cookies. Contact admin to set up cookies." });
+      }
+      if (stderrMsg.includes("blocked") || stderrMsg.includes("ip")) {
+        return res.status(403).json({ error: "Access blocked by this platform. The server IP may be restricted." });
+      }
+      if (stderrMsg.includes("not available") || stderrMsg.includes("removed") || stderrMsg.includes("deleted")) {
+        return res.status(404).json({ error: "This video is not available. It may have been removed or is private." });
+      }
+      if (stderrMsg.includes("no video") || stderrMsg.includes("unable to extract")) {
+        return res.status(404).json({ error: "No video found at this URL. Make sure the link is correct." });
       }
       return res.status(500).json({ error: "Failed to analyze video. Please check the URL and try again." });
     }
@@ -403,6 +449,8 @@ async function registerRoutes(app2) {
         }
         const hasFfmpeg = await checkFfmpeg();
         const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const dlPlatform = detectPlatform(cleanUrl);
+        const dlNeedsImpersonate = ["TikTok", "Instagram", "Twitter/X"].includes(dlPlatform);
         const args = [
           "--no-playlist",
           "--no-warnings",
@@ -415,6 +463,7 @@ async function registerRoutes(app2) {
           "4",
           "--buffer-size",
           "16K",
+          ...dlNeedsImpersonate ? ["--impersonate", "Chrome"] : [],
           ...getCookiesArgs()
         ];
         let ext;
@@ -594,14 +643,14 @@ async function registerRoutes(app2) {
       return res.status(500).json({ error: "Failed to get thumbnail" });
     }
   });
-  const httpServer = createServer(app2);
+  const httpServer = (0, import_node_http.createServer)(app2);
   return httpServer;
 }
 
 // server/index.ts
-import * as fs2 from "fs";
-import * as path2 from "path";
-var app = express();
+var fs2 = __toESM(require("fs"));
+var path2 = __toESM(require("path"));
+var app = (0, import_express.default)();
 var log = console.log;
 function setupCors(app2) {
   app2.use((req, res, next) => {
@@ -633,13 +682,13 @@ function setupCors(app2) {
 }
 function setupBodyParsing(app2) {
   app2.use(
-    express.json({
+    import_express.default.json({
       verify: (req, _res, buf) => {
         req.rawBody = buf;
       }
     })
   );
-  app2.use(express.urlencoded({ extended: false }));
+  app2.use(import_express.default.urlencoded({ extended: false }));
 }
 function setupRequestLogging(app2) {
   app2.use((req, res, next) => {
@@ -741,8 +790,8 @@ function configureExpoAndLanding(app2) {
     }
     next();
   });
-  app2.use("/assets", express.static(path2.resolve(process.cwd(), "assets")));
-  app2.use(express.static(path2.resolve(process.cwd(), "static-build")));
+  app2.use("/assets", import_express.default.static(path2.resolve(process.cwd(), "assets")));
+  app2.use(import_express.default.static(path2.resolve(process.cwd(), "static-build")));
   log("Expo routing: Checking expo-platform header on / and /manifest");
 }
 function setupErrorHandler(app2) {

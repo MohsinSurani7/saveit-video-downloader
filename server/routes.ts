@@ -344,6 +344,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json(cached.data);
       }
 
+      const platform = detectPlatform(cleanUrl);
+      const needsImpersonate = ["TikTok", "Instagram", "Twitter/X"].includes(platform);
+
       const analyzeArgs = [
         "--dump-json",
         "--no-download",
@@ -352,16 +355,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "--no-check-certificates",
         "--no-check-formats",
         "--skip-download",
-        "--socket-timeout", "10",
-        "--retries", "2",
+        "--socket-timeout", "15",
+        "--retries", "3",
+        ...(needsImpersonate ? ["--impersonate", "Chrome"] : []),
         ...getCookiesArgs(),
         cleanUrl,
       ];
 
-      console.log("Analyzing:", cleanUrl);
+      console.log("Analyzing:", cleanUrl, `(platform: ${platform}, impersonate: ${needsImpersonate})`);
       const startTime = Date.now();
 
-      const stdout = await analyzeWithTimeout(analyzeArgs, 45000);
+      let stdout: string;
+      try {
+        stdout = await analyzeWithTimeout(analyzeArgs, 60000);
+      } catch (firstErr: any) {
+        if (needsImpersonate && firstErr.stderr?.includes("blocked")) {
+          console.log("First attempt blocked, retrying with Safari impersonation...");
+          const retryArgs = analyzeArgs.map(a => a === "Chrome" ? "Safari" : a);
+          stdout = await analyzeWithTimeout(retryArgs, 60000);
+        } else {
+          throw firstErr;
+        }
+      }
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.log(`Analyze completed in ${elapsed}s`);
@@ -369,7 +384,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
 
-      const platform = detectPlatform(cleanUrl);
       const isYouTube = platform === "Video";
 
       let directUrl: string | undefined;
@@ -430,9 +444,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (error.message?.includes("timeout")) {
         return res.status(504).json({ error: "Analysis timed out. Try a shorter video or different URL." });
       }
-      const stderrMsg = error.stderr || "";
-      if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
-        return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+      const stderrMsg = (error.stderr || "").toLowerCase();
+      if (stderrMsg.includes("login required") || stderrMsg.includes("sign in") || stderrMsg.includes("authentication")) {
+        return res.status(403).json({ error: "This platform requires login cookies. Contact admin to set up cookies." });
+      }
+      if (stderrMsg.includes("blocked") || stderrMsg.includes("ip")) {
+        return res.status(403).json({ error: "Access blocked by this platform. The server IP may be restricted." });
+      }
+      if (stderrMsg.includes("not available") || stderrMsg.includes("removed") || stderrMsg.includes("deleted")) {
+        return res.status(404).json({ error: "This video is not available. It may have been removed or is private." });
+      }
+      if (stderrMsg.includes("no video") || stderrMsg.includes("unable to extract")) {
+        return res.status(404).json({ error: "No video found at this URL. Make sure the link is correct." });
       }
       return res.status(500).json({ error: "Failed to analyze video. Please check the URL and try again." });
     }
@@ -472,6 +495,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         const hasFfmpeg = await checkFfmpeg();
         const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const dlPlatform = detectPlatform(cleanUrl);
+        const dlNeedsImpersonate = ["TikTok", "Instagram", "Twitter/X"].includes(dlPlatform);
 
         const args: string[] = [
           "--no-playlist",
@@ -481,6 +506,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           "--retries", "3",
           "--concurrent-fragments", "4",
           "--buffer-size", "16K",
+          ...(dlNeedsImpersonate ? ["--impersonate", "Chrome"] : []),
           ...getCookiesArgs(),
         ];
 
