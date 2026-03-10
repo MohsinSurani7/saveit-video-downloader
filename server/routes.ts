@@ -121,8 +121,6 @@ function detectPlatform(url: string): string {
   return "Other";
 }
 
-const STANDARD_RESOLUTIONS = [2160, 1440, 1080, 720, 480, 360, 240, 144];
-
 function parseFormats(rawFormats: any[]): VideoFormat[] {
   if (!rawFormats) return [];
 
@@ -227,8 +225,92 @@ function cleanupOldFiles() {
 
 setInterval(cleanupOldFiles, 5 * 60 * 1000);
 
+function analyzeWithTimeout(args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(YT_DLP_PATH, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+
+    const timer = setTimeout(() => {
+      killed = true;
+      proc.kill("SIGKILL");
+      reject(new Error("timeout"));
+    }, timeoutMs);
+
+    proc.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+
+    proc.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (killed) return;
+      if (code !== 0) {
+        const err: any = new Error(`yt-dlp exited with code ${code}`);
+        err.stderr = stderr;
+        reject(err);
+      } else {
+        resolve(stdout);
+      }
+    });
+
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+function downloadWithSpawn(args: string[], timeoutMs: number): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(YT_DLP_PATH, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stderr = "";
+    let killed = false;
+
+    const timer = setTimeout(() => {
+      killed = true;
+      proc.kill("SIGKILL");
+      reject(new Error("Download timed out"));
+    }, timeoutMs);
+
+    proc.stdout.on("data", () => {});
+
+    proc.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+      if (stderr.length > 50000) {
+        stderr = stderr.slice(-30000);
+      }
+    });
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (killed) return;
+      resolve({ code: code || 0, stderr });
+    });
+
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
 export async function registerRoutes(app: Express): Promise<Server> {
   checkFfmpeg();
+
+  app.get("/api/health", (_req: Request, res: Response) => {
+    res.json({ status: "ok", timestamp: Date.now() });
+  });
 
   app.post("/api/analyze", async (req: Request, res: Response) => {
     try {
@@ -263,12 +345,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "--no-warnings",
         "--no-check-certificates",
         "--no-check-formats",
-        "--socket-timeout", "15",
+        "--skip-download",
+        "--socket-timeout", "10",
+        "--retries", "2",
         ...getCookiesArgs(),
         cleanUrl,
       ];
 
-      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, analyzeArgs, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
+      console.log("Analyzing:", cleanUrl);
+      const startTime = Date.now();
+
+      const stdout = await analyzeWithTimeout(analyzeArgs, 45000);
+
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`Analyze completed in ${elapsed}s`);
 
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
@@ -294,7 +384,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Analyze error:", error.message);
       console.error("Analyze stderr:", error.stderr || "none");
       if (error.message?.includes("timeout")) {
-        return res.status(504).json({ error: "Request timed out. The video might be unavailable." });
+        return res.status(504).json({ error: "Analysis timed out. Try a shorter video or different URL." });
       }
       const stderrMsg = error.stderr || "";
       if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
@@ -335,6 +425,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "--socket-timeout", "15",
         "--retries", "3",
         "--concurrent-fragments", "4",
+        "--buffer-size", "16K",
         ...getCookiesArgs(),
       ];
 
@@ -355,7 +446,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`);
         args.push("-o", outputPath);
 
-        if (hasFfmpeg) {
+        if (formatId) {
+          if (hasFfmpeg) {
+            args.push("-f", `${formatId}+bestaudio/best[ext=mp4]/best`);
+            args.push("--merge-output-format", "mp4");
+            args.push("--remux-video", "mp4");
+          } else {
+            args.push("-f", `${formatId}/best[ext=mp4]/best`);
+          }
+        } else if (hasFfmpeg) {
           args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
           args.push("-f", "bv*+ba/b");
           args.push("--merge-output-format", "mp4");
@@ -370,18 +469,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.log("Download started:", cleanUrl);
       const startTime = Date.now();
 
+      const downloadTimeout = 30 * 60 * 1000;
+
       try {
-        await execFileAsync(YT_DLP_PATH, args, {
-          timeout: 600000,
-          maxBuffer: 10 * 1024 * 1024,
-        });
-      } catch (dlError: any) {
-        console.error("yt-dlp error:", dlError.stderr || dlError.message);
-        const stderrMsg = dlError.stderr || "";
-        if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
-          return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+        const result = await downloadWithSpawn(args, downloadTimeout);
+        if (result.code !== 0) {
+          console.error("yt-dlp error:", result.stderr);
+          const stderrMsg = result.stderr;
+          if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
+            return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+          }
+          return res.status(500).json({ error: `Download failed: ${stderrMsg.split('\n').filter((l: string) => l.startsWith('ERROR')).join('; ') || 'Unknown error'}` });
         }
-        return res.status(500).json({ error: `Download failed: ${stderrMsg.split('\n').filter((l: string) => l.startsWith('ERROR')).join('; ') || 'Unknown error'}` });
+      } catch (dlError: any) {
+        console.error("Download error:", dlError.message);
+        if (dlError.message?.includes("timed out")) {
+          return res.status(504).json({ error: "Download timed out. Video might be too long or slow." });
+        }
+        return res.status(500).json({ error: "Download failed. Please try again." });
       }
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -487,15 +592,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       args.push(cleanUrl);
 
-      const { stdout } = await execFileAsync(YT_DLP_PATH, args, {
-        timeout: 30000,
-        maxBuffer: 5 * 1024 * 1024,
-      });
+      const stdout = await analyzeWithTimeout(args, 20000);
 
       const directUrl = stdout.trim().split("\n")[0];
 
       if (!directUrl || !directUrl.startsWith("http")) {
-        return res.status(500).json({ error: "Could not extract direct URL, using server download instead", fallback: true });
+        return res.json({ error: "Direct URL not available", fallback: true });
       }
 
       return res.json({ directUrl, method: "direct" });
@@ -517,14 +619,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "Invalid URL" });
       }
 
-      const { stdout } = await execFileAsync(YT_DLP_PATH, [
+      const stdout = await analyzeWithTimeout([
         "--get-thumbnail",
         "--no-download",
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
         cleanUrl,
-      ], { timeout: 15000 });
+      ], 15000);
 
       const thumbnailUrl = stdout.trim();
       return res.json({ thumbnailUrl });

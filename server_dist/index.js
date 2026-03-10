@@ -3,7 +3,7 @@ import express from "express";
 
 // server/routes.ts
 import { createServer } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -200,8 +200,78 @@ function cleanupOldFiles() {
   }
 }
 setInterval(cleanupOldFiles, 5 * 60 * 1e3);
+function analyzeWithTimeout(args, timeoutMs) {
+  return new Promise((resolve2, reject) => {
+    const proc = spawn(YT_DLP_PATH, args, {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+    const timer = setTimeout(() => {
+      killed = true;
+      proc.kill("SIGKILL");
+      reject(new Error("timeout"));
+    }, timeoutMs);
+    proc.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (killed) return;
+      if (code !== 0) {
+        const err = new Error(`yt-dlp exited with code ${code}`);
+        err.stderr = stderr;
+        reject(err);
+      } else {
+        resolve2(stdout);
+      }
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+function downloadWithSpawn(args, timeoutMs) {
+  return new Promise((resolve2, reject) => {
+    const proc = spawn(YT_DLP_PATH, args, {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stderr = "";
+    let killed = false;
+    const timer = setTimeout(() => {
+      killed = true;
+      proc.kill("SIGKILL");
+      reject(new Error("Download timed out"));
+    }, timeoutMs);
+    proc.stdout.on("data", () => {
+    });
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      if (stderr.length > 5e4) {
+        stderr = stderr.slice(-3e4);
+      }
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (killed) return;
+      resolve2({ code: code || 0, stderr });
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
 async function registerRoutes(app2) {
   checkFfmpeg();
+  app2.get("/api/health", (_req, res) => {
+    res.json({ status: "ok", timestamp: Date.now() });
+  });
   app2.post("/api/analyze", async (req, res) => {
     try {
       const ip = req.ip || req.socket.remoteAddress || "unknown";
@@ -230,12 +300,19 @@ async function registerRoutes(app2) {
         "--no-warnings",
         "--no-check-certificates",
         "--no-check-formats",
+        "--skip-download",
         "--socket-timeout",
-        "15",
+        "10",
+        "--retries",
+        "2",
         ...getCookiesArgs(),
         cleanUrl
       ];
-      const { stdout, stderr } = await execFileAsync(YT_DLP_PATH, analyzeArgs, { timeout: 3e4, maxBuffer: 10 * 1024 * 1024 });
+      console.log("Analyzing:", cleanUrl);
+      const startTime = Date.now();
+      const stdout = await analyzeWithTimeout(analyzeArgs, 45e3);
+      const elapsed = ((Date.now() - startTime) / 1e3).toFixed(1);
+      console.log(`Analyze completed in ${elapsed}s`);
       const rawInfo = JSON.parse(stdout);
       const formats = parseFormats(rawInfo.formats);
       const videoInfo = {
@@ -257,7 +334,7 @@ async function registerRoutes(app2) {
       console.error("Analyze error:", error.message);
       console.error("Analyze stderr:", error.stderr || "none");
       if (error.message?.includes("timeout")) {
-        return res.status(504).json({ error: "Request timed out. The video might be unavailable." });
+        return res.status(504).json({ error: "Analysis timed out. Try a shorter video or different URL." });
       }
       const stderrMsg = error.stderr || "";
       if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
@@ -295,6 +372,8 @@ async function registerRoutes(app2) {
         "3",
         "--concurrent-fragments",
         "4",
+        "--buffer-size",
+        "16K",
         ...getCookiesArgs()
       ];
       let ext;
@@ -311,7 +390,15 @@ async function registerRoutes(app2) {
         ext = "mp4";
         const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`);
         args.push("-o", outputPath);
-        if (hasFfmpeg) {
+        if (formatId) {
+          if (hasFfmpeg) {
+            args.push("-f", `${formatId}+bestaudio/best[ext=mp4]/best`);
+            args.push("--merge-output-format", "mp4");
+            args.push("--remux-video", "mp4");
+          } else {
+            args.push("-f", `${formatId}/best[ext=mp4]/best`);
+          }
+        } else if (hasFfmpeg) {
           args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
           args.push("-f", "bv*+ba/b");
           args.push("--merge-output-format", "mp4");
@@ -323,18 +410,23 @@ async function registerRoutes(app2) {
       args.push(cleanUrl);
       console.log("Download started:", cleanUrl);
       const startTime = Date.now();
+      const downloadTimeout = 30 * 60 * 1e3;
       try {
-        await execFileAsync(YT_DLP_PATH, args, {
-          timeout: 6e5,
-          maxBuffer: 10 * 1024 * 1024
-        });
-      } catch (dlError) {
-        console.error("yt-dlp error:", dlError.stderr || dlError.message);
-        const stderrMsg = dlError.stderr || "";
-        if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
-          return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+        const result = await downloadWithSpawn(args, downloadTimeout);
+        if (result.code !== 0) {
+          console.error("yt-dlp error:", result.stderr);
+          const stderrMsg = result.stderr;
+          if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
+            return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+          }
+          return res.status(500).json({ error: `Download failed: ${stderrMsg.split("\n").filter((l) => l.startsWith("ERROR")).join("; ") || "Unknown error"}` });
         }
-        return res.status(500).json({ error: `Download failed: ${stderrMsg.split("\n").filter((l) => l.startsWith("ERROR")).join("; ") || "Unknown error"}` });
+      } catch (dlError) {
+        console.error("Download error:", dlError.message);
+        if (dlError.message?.includes("timed out")) {
+          return res.status(504).json({ error: "Download timed out. Video might be too long or slow." });
+        }
+        return res.status(500).json({ error: "Download failed. Please try again." });
       }
       const elapsed = ((Date.now() - startTime) / 1e3).toFixed(1);
       console.log(`Download completed in ${elapsed}s`);
@@ -424,13 +516,10 @@ async function registerRoutes(app2) {
         args.push("-f", "best[ext=mp4]/best[vcodec!=none][acodec!=none]/best");
       }
       args.push(cleanUrl);
-      const { stdout } = await execFileAsync(YT_DLP_PATH, args, {
-        timeout: 3e4,
-        maxBuffer: 5 * 1024 * 1024
-      });
+      const stdout = await analyzeWithTimeout(args, 2e4);
       const directUrl = stdout.trim().split("\n")[0];
       if (!directUrl || !directUrl.startsWith("http")) {
-        return res.status(500).json({ error: "Could not extract direct URL, using server download instead", fallback: true });
+        return res.json({ error: "Direct URL not available", fallback: true });
       }
       return res.json({ directUrl, method: "direct" });
     } catch (error) {
@@ -448,14 +537,14 @@ async function registerRoutes(app2) {
       if (!isValidUrl(cleanUrl)) {
         return res.status(400).json({ error: "Invalid URL" });
       }
-      const { stdout } = await execFileAsync(YT_DLP_PATH, [
+      const stdout = await analyzeWithTimeout([
         "--get-thumbnail",
         "--no-download",
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
         cleanUrl
-      ], { timeout: 15e3 });
+      ], 15e3);
       const thumbnailUrl = stdout.trim();
       return res.json({ thumbnailUrl });
     } catch (error) {
@@ -634,14 +723,7 @@ function setupErrorHandler(app2) {
   const server = await registerRoutes(app);
   setupErrorHandler(app);
   const port = parseInt(process.env.PORT || "5000", 10);
-  server.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true
-    },
-    () => {
-      log(`express server serving on port ${port}`);
-    }
-  );
+  server.listen(port, "0.0.0.0", () => {
+    log(`express server serving on port ${port}`);
+  });
 })();
