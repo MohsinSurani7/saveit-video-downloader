@@ -24,13 +24,6 @@ import { DownloadButton } from "@/components/DownloadButton";
 
 type DownloadState = "idle" | "preparing" | "downloading" | "paused" | "saving";
 
-class PausedError extends Error {
-  constructor() { super("paused"); this.name = "PausedError"; }
-}
-class CancelledError extends Error {
-  constructor() { super("cancelled"); this.name = "CancelledError"; }
-}
-
 export default function DownloadScreen() {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
@@ -43,6 +36,7 @@ export default function DownloadScreen() {
   const [downloadState, setDownloadState] = useState<DownloadState>("idle");
   const downloadResumableRef = useRef<FileSystem.DownloadResumable | null>(null);
   const currentFilenameRef = useRef<string>("");
+  const pausedRef = useRef(false);
   const cancelledRef = useRef(false);
 
   const analyzeMutation = useMutation({
@@ -74,7 +68,7 @@ export default function DownloadScreen() {
     }
   };
 
-  const recordHistory = async () => {
+  const recordHistory = useCallback(async () => {
     if (videoInfo) {
       await addToHistory({
         id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
@@ -87,16 +81,17 @@ export default function DownloadScreen() {
         url: videoInfo.url,
       });
     }
-  };
+  }, [videoInfo, selectedFormat, downloadType]);
 
-  const downloadMutation = useMutation({
-    mutationFn: async () => {
-      if (!videoInfo) throw new Error("No video selected");
+  const startDownload = useCallback(async () => {
+    if (!videoInfo) return;
 
-      cancelledRef.current = false;
-      setDownloadProgress(0);
-      setDownloadState("preparing");
+    pausedRef.current = false;
+    cancelledRef.current = false;
+    setDownloadProgress(0);
+    setDownloadState("preparing");
 
+    try {
       if (Platform.OS === "web") {
         const res = await apiRequest("POST", "/api/download", {
           url: videoInfo.url,
@@ -117,48 +112,29 @@ export default function DownloadScreen() {
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        return data;
+        setDownloadState("idle");
+        return;
       }
 
-      let fileUrl: string;
-      let filename: string;
+      if (cancelledRef.current) { setDownloadState("idle"); return; }
 
-      try {
-        const urlRes = await apiRequest("POST", "/api/get-url", {
-          url: videoInfo.url,
-          type: downloadType,
-          formatId: selectedFormat?.formatId,
-        });
-        const urlData = await urlRes.json();
+      const res = await apiRequest("POST", "/api/download", {
+        url: videoInfo.url,
+        formatId: selectedFormat?.formatId,
+        type: downloadType,
+        title: videoInfo.title,
+      });
+      const data = (await res.json()) as {
+        fileId: string;
+        filename: string;
+        downloadPath: string;
+      };
 
-        if (urlData.directUrl && !urlData.fallback) {
-          fileUrl = urlData.directUrl;
-          const ext = downloadType === "audio" ? "m4a" : "mp4";
-          const safeTitle = videoInfo.title.replace(/[^a-zA-Z0-9._\- ]/g, "_").slice(0, 100);
-          filename = `${safeTitle}.${ext}`;
-        } else {
-          throw new Error("fallback");
-        }
-      } catch {
-        if (cancelledRef.current) throw new CancelledError();
-        const res = await apiRequest("POST", "/api/download", {
-          url: videoInfo.url,
-          formatId: selectedFormat?.formatId,
-          type: downloadType,
-          title: videoInfo.title,
-        });
-        const data = (await res.json()) as {
-          fileId: string;
-          filename: string;
-          downloadPath: string;
-        };
-        const baseUrl = getApiUrl();
-        fileUrl = new URL(data.downloadPath, baseUrl).toString();
-        filename = data.filename;
-      }
+      if (cancelledRef.current) { setDownloadState("idle"); return; }
 
-      if (cancelledRef.current) throw new CancelledError();
-
+      const baseUrl = getApiUrl();
+      const fileUrl = new URL(data.downloadPath, baseUrl).toString();
+      const filename = data.filename;
       const localUri = FileSystem.documentDirectory + filename;
       currentFilenameRef.current = filename;
 
@@ -182,14 +158,17 @@ export default function DownloadScreen() {
       try {
         result = await downloadResumable.downloadAsync();
       } catch (e: any) {
-        if (cancelledRef.current) throw new CancelledError();
-        if (downloadState === "paused") throw new PausedError();
+        if (pausedRef.current || cancelledRef.current) {
+          return;
+        }
         throw e;
       }
 
+      if (pausedRef.current) return;
+      if (cancelledRef.current) { setDownloadState("idle"); return; }
+
       if (!result?.uri) {
-        if (cancelledRef.current) throw new CancelledError();
-        throw new Error("Download failed");
+        throw new Error("Download failed - no file received");
       }
 
       downloadResumableRef.current = null;
@@ -198,45 +177,43 @@ export default function DownloadScreen() {
       await saveToGallery(result.uri, filename);
       await recordHistory();
 
-      return { filename, fileId: "" };
-    },
-    onSuccess: () => {
-      setDownloadProgress(0);
       setDownloadState("idle");
-    },
-    onError: (error: Error) => {
-      if (error instanceof PausedError) {
-        return;
-      }
-      if (error instanceof CancelledError) {
-        setDownloadProgress(0);
-        setDownloadState("idle");
-        downloadResumableRef.current = null;
-        return;
-      }
       setDownloadProgress(0);
-      setDownloadState("idle");
+    } catch (error: any) {
+      if (pausedRef.current || cancelledRef.current) return;
       downloadResumableRef.current = null;
+      setDownloadState("idle");
+      setDownloadProgress(0);
       Alert.alert("Error", error.message || "Failed to download");
-    },
-  });
+    }
+  }, [videoInfo, selectedFormat, downloadType, recordHistory]);
 
   const handlePause = useCallback(async () => {
-    if (downloadResumableRef.current && downloadState === "downloading") {
+    if (downloadResumableRef.current) {
+      pausedRef.current = true;
+      setDownloadState("paused");
       try {
-        setDownloadState("paused");
         await downloadResumableRef.current.pauseAsync();
       } catch (e) {
-        console.error("Pause error:", e);
+        console.log("Pause completed");
       }
     }
-  }, [downloadState]);
+  }, []);
 
   const handleResume = useCallback(async () => {
-    if (downloadResumableRef.current && downloadState === "paused") {
+    if (downloadResumableRef.current) {
+      pausedRef.current = false;
+      setDownloadState("downloading");
       try {
-        setDownloadState("downloading");
         const result = await downloadResumableRef.current.resumeAsync();
+
+        if (cancelledRef.current) {
+          setDownloadState("idle");
+          setDownloadProgress(0);
+          downloadResumableRef.current = null;
+          return;
+        }
+
         if (!result?.uri) throw new Error("Resume failed");
 
         downloadResumableRef.current = null;
@@ -248,23 +225,18 @@ export default function DownloadScreen() {
         setDownloadState("idle");
         setDownloadProgress(0);
       } catch (e: any) {
-        if (cancelledRef.current) {
-          setDownloadState("idle");
-          setDownloadProgress(0);
-          downloadResumableRef.current = null;
-          return;
-        }
-        if (downloadState === "paused") return;
+        if (pausedRef.current || cancelledRef.current) return;
         setDownloadState("idle");
         setDownloadProgress(0);
         downloadResumableRef.current = null;
         Alert.alert("Error", e.message || "Resume failed");
       }
     }
-  }, [downloadState, videoInfo, selectedFormat, downloadType]);
+  }, [recordHistory]);
 
   const handleCancel = useCallback(() => {
     cancelledRef.current = true;
+    pausedRef.current = false;
     if (downloadResumableRef.current) {
       downloadResumableRef.current.pauseAsync().catch(() => {});
       downloadResumableRef.current = null;
@@ -278,10 +250,6 @@ export default function DownloadScreen() {
     setSelectedFormat(null);
     analyzeMutation.mutate(url);
   }, []);
-
-  const handleDownload = useCallback(() => {
-    downloadMutation.mutate();
-  }, [videoInfo, selectedFormat, downloadType]);
 
   const handleTypeChange = useCallback(
     (type: "video" | "audio") => {
@@ -299,7 +267,7 @@ export default function DownloadScreen() {
 
   const getStatusText = () => {
     switch (downloadState) {
-      case "preparing": return "Preparing download...";
+      case "preparing": return "Server is preparing your file...";
       case "downloading": return `Downloading... ${downloadProgress}%`;
       case "paused": return `Paused at ${downloadProgress}%`;
       case "saving": return "Saving to gallery...";
@@ -400,7 +368,7 @@ export default function DownloadScreen() {
 
             {!isDownloading && (
               <DownloadButton
-                onPress={handleDownload}
+                onPress={startDownload}
                 isLoading={false}
                 disabled={!selectedFormat && downloadType === "video"}
                 label={
