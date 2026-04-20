@@ -17,7 +17,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_DOMAIN": "16.171.153.11:5000"
+        "EXPO_PUBLIC_DOMAIN": "13.63.177.62:5000"
       }
     },
     "production": {
@@ -26,7 +26,7 @@
       },
       "autoIncrement": true,
       "env": {
-        "EXPO_PUBLIC_DOMAIN": "16.171.153.11:5000"
+        "EXPO_PUBLIC_DOMAIN": "13.63.177.62:5000"
       }
     }
   },
