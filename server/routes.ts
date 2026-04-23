@@ -191,6 +191,16 @@ interface VideoInfo {
 
 const analysisCache = new Map<string, { data: VideoInfo; timestamp: number }>();
 const CACHE_TTL = 10 * 60 * 1000;
+const BACKOFF_MS = [0, 800, 1600];
+
+type ErrorBucket =
+  | "private_or_restricted"
+  | "geo_or_network"
+  | "rate_limited"
+  | "not_found_or_removed"
+  | "unsupported_or_extract_failed"
+  | "timeout"
+  | "unknown";
 
 function isValidUrl(str: string): boolean {
   try {
@@ -203,6 +213,125 @@ function isValidUrl(str: string): boolean {
 
 function sanitizeUrl(url: string): string {
   return url.trim().replace(/[;&|`$(){}]/g, "");
+}
+
+function normalizeUrl(inputUrl: string): string {
+  try {
+    const parsed = new URL(inputUrl);
+    const host = parsed.hostname.toLowerCase();
+    const normalizedHost = host.replace(/^m\./, "").replace(/^www\./, "");
+
+    if (normalizedHost === "youtu.be") {
+      const videoId = parsed.pathname.split("/").filter(Boolean)[0];
+      if (videoId) {
+        const next = new URL("https://www.youtube.com/watch");
+        next.searchParams.set("v", videoId);
+        return next.toString();
+      }
+    }
+
+    if (normalizedHost === "youtube.com") {
+      if (parsed.pathname.startsWith("/shorts/")) {
+        const videoId = parsed.pathname.split("/").filter(Boolean)[1];
+        if (videoId) {
+          const next = new URL("https://www.youtube.com/watch");
+          next.searchParams.set("v", videoId);
+          return next.toString();
+        }
+      }
+      if (parsed.pathname === "/watch") {
+        const next = new URL("https://www.youtube.com/watch");
+        const v = parsed.searchParams.get("v");
+        if (v) {
+          next.searchParams.set("v", v);
+          return next.toString();
+        }
+      }
+    }
+
+    if (normalizedHost === "instagram.com") {
+      // Remove noisy query params from copied share links.
+      parsed.search = "";
+      return parsed.toString();
+    }
+
+    return parsed.toString();
+  } catch {
+    return inputUrl;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function mapYtDlpError(stderrText: string): {
+  bucket: ErrorBucket;
+  status: number;
+  message: string;
+} {
+  const stderrMsg = (stderrText || "").toLowerCase();
+  if (stderrMsg.includes("timed out") || stderrMsg.includes("timeout")) {
+    return {
+      bucket: "timeout",
+      status: 504,
+      message: "Request timed out while contacting the video platform. Please retry.",
+    };
+  }
+  if (
+    stderrMsg.includes("login required") ||
+    stderrMsg.includes("sign in") ||
+    stderrMsg.includes("authentication")
+  ) {
+    return {
+      bucket: "private_or_restricted",
+      status: 422,
+      message: "This video is private or restricted by the platform. Please try a public link.",
+    };
+  }
+  if (stderrMsg.includes("rate-limit") || stderrMsg.includes("too many requests")) {
+    return {
+      bucket: "rate_limited",
+      status: 429,
+      message: "Platform rate limit reached. Please retry in a few minutes.",
+    };
+  }
+  if (
+    stderrMsg.includes("blocked") ||
+    stderrMsg.includes("forbidden") ||
+    stderrMsg.includes("403") ||
+    stderrMsg.includes("geo")
+  ) {
+    return {
+      bucket: "geo_or_network",
+      status: 403,
+      message: "This content is blocked in the current server region or by network policy.",
+    };
+  }
+  if (
+    stderrMsg.includes("not available") ||
+    stderrMsg.includes("removed") ||
+    stderrMsg.includes("deleted") ||
+    stderrMsg.includes("private video")
+  ) {
+    return {
+      bucket: "not_found_or_removed",
+      status: 404,
+      message: "This video is not available anymore or has been removed.",
+    };
+  }
+  if (stderrMsg.includes("no video") || stderrMsg.includes("unable to extract")) {
+    return {
+      bucket: "unsupported_or_extract_failed",
+      status: 422,
+      message: "Could not extract this link. Try a direct public post/video URL.",
+    };
+  }
+  return {
+    bucket: "unknown",
+    status: 500,
+    message: "Unable to process this URL right now. Please try again.",
+  };
 }
 
 function sanitizeFilename(name: string): string {
@@ -252,6 +381,163 @@ function detectPlatform(url: string): string {
   if (hostname.includes("twitch.tv")) return "Twitch";
   if (hostname.includes("soundcloud.com")) return "SoundCloud";
   return "Other";
+}
+
+function buildAnalyzeStrategies(platform: string, cleanUrl: string): string[][] {
+  const base = [
+    "--dump-json",
+    "--no-download",
+    "--no-playlist",
+    "--no-warnings",
+    "--no-check-certificates",
+    "--no-check-formats",
+    "--skip-download",
+    "--socket-timeout",
+    platform === "Video" ? "20" : "15",
+    "--retries",
+    platform === "Video" ? "3" : "2",
+    ...getCookiesArgs(),
+  ];
+
+  const strategies: string[][] = [];
+  strategies.push([...base, cleanUrl]);
+
+  if (["Instagram", "Twitter/X", "Video"].includes(platform)) {
+    strategies.push([...base, "--impersonate", "Chrome", cleanUrl]);
+  }
+
+  if (platform === "Video") {
+    strategies.push([
+      ...base,
+      "--extractor-args",
+      "youtube:player_client=android,web",
+      "--impersonate",
+      "Chrome",
+      cleanUrl,
+    ]);
+  }
+
+  return strategies;
+}
+
+function isRetryableAnalyzeError(stderrText: string): boolean {
+  const stderrMsg = (stderrText || "").toLowerCase();
+  return (
+    stderrMsg.includes("timed out") ||
+    stderrMsg.includes("timeout") ||
+    stderrMsg.includes("429") ||
+    stderrMsg.includes("rate-limit") ||
+    stderrMsg.includes("http error 5") ||
+    stderrMsg.includes("temporary")
+  );
+}
+
+async function runAnalyzeStrategies(platform: string, cleanUrl: string): Promise<string> {
+  const strategies = buildAnalyzeStrategies(platform, cleanUrl);
+  let lastError: any = new Error("No analyze strategy attempted");
+
+  for (let attempt = 0; attempt < strategies.length; attempt++) {
+    const args = strategies[attempt];
+    try {
+      if (BACKOFF_MS[attempt]) {
+        await sleep(BACKOFF_MS[attempt]);
+      }
+      return await analyzeWithTimeout(args, attempt === 0 ? 45000 : 35000);
+    } catch (error: any) {
+      lastError = error;
+      const retryable = isRetryableAnalyzeError(error?.stderr || error?.message || "");
+      if (!retryable && attempt === 0 && strategies.length > 1) {
+        // Still try alternative extraction profile for better platform coverage.
+        continue;
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+function buildDownloadStrategies({
+  platform,
+  cleanUrl,
+  outputPath,
+  type,
+  quality,
+  hasFfmpeg,
+}: {
+  platform: string;
+  cleanUrl: string;
+  outputPath: string;
+  type: string;
+  quality?: string;
+  hasFfmpeg: boolean;
+}): string[][] {
+  const common = [
+    "--no-playlist",
+    "--no-warnings",
+    "--no-check-certificates",
+    "--socket-timeout",
+    "20",
+    "--retries",
+    "4",
+    "--concurrent-fragments",
+    "4",
+    "--buffer-size",
+    "16K",
+    ...getCookiesArgs(),
+    ...(platform === "Instagram" || platform === "Twitter/X" || platform === "Video"
+      ? ["--impersonate", "Chrome"]
+      : []),
+    "-o",
+    outputPath,
+  ];
+
+  if (type === "audio") {
+    if (hasFfmpeg) {
+      return [
+        [...common, "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", cleanUrl],
+        [...common, "-f", "bestaudio[ext=m4a]/bestaudio", cleanUrl],
+      ];
+    }
+    return [[...common, "-f", "bestaudio[ext=m4a]/bestaudio", cleanUrl]];
+  }
+
+  const resHeight = quality ? parseInt(quality, 10) : 0;
+  if (hasFfmpeg) {
+    const sortExpr = resHeight > 0
+      ? `res:${resHeight},vcodec:h264,acodec:aac,ext:mp4`
+      : "vcodec:h264,acodec:aac,ext:mp4,res";
+    return [
+      [
+        ...common,
+        "-S",
+        sortExpr,
+        "-f",
+        "bv*+ba/b",
+        "--merge-output-format",
+        "mp4",
+        "--remux-video",
+        "mp4",
+        cleanUrl,
+      ],
+      [...common, "-f", "best[ext=mp4][vcodec!=none][acodec!=none]/best", cleanUrl],
+      [...common, "-f", "best", cleanUrl],
+    ];
+  }
+
+  return [
+    [...common, "-f", "best[ext=mp4]/best", cleanUrl],
+    [...common, "-f", "best", cleanUrl],
+  ];
+}
+
+async function runYtDlpAutoUpdate(): Promise<void> {
+  try {
+    const args = [...YT_DLP_COMMAND.baseArgs, "-U"];
+    await execFileAsync(YT_DLP_COMMAND.command, args, { timeout: 45000 });
+    console.log("yt-dlp update check completed");
+  } catch (error: any) {
+    console.log(`yt-dlp auto-update skipped/failed: ${error?.message || "unknown"}`);
+  }
 }
 
 function parseFormats(rawFormats: any[]): VideoFormat[] {
@@ -452,9 +738,53 @@ export async function registerRoutes(app: Express): Promise<Server> {
   console.log(`Using yt-dlp command: ${YT_DLP_COMMAND.command}`);
   checkFfmpeg();
   fetchProxies().catch(() => {});
+  runYtDlpAutoUpdate();
+  setInterval(() => {
+    runYtDlpAutoUpdate();
+  }, 12 * 60 * 60 * 1000);
 
   app.get("/api/health", (_req: Request, res: Response) => {
     res.json({ status: "ok", timestamp: Date.now(), proxies: proxyList.length });
+  });
+
+  app.get("/api/health/deep", async (_req: Request, res: Response) => {
+    const ytTestUrl = process.env.HEALTHCHECK_YT_URL;
+    const igTestUrl = process.env.HEALTHCHECK_IG_URL;
+    const checks: Record<string, string> = {};
+
+    try {
+      if (ytTestUrl) {
+        const cleanYt = normalizeUrl(sanitizeUrl(ytTestUrl));
+        const ytOut = await analyzeWithTimeout(
+          ["--get-id", "--no-playlist", "--no-warnings", cleanYt],
+          20000,
+        );
+        checks.youtube = ytOut.trim() ? "ok" : "failed";
+      }
+
+      if (igTestUrl) {
+        const cleanIg = normalizeUrl(sanitizeUrl(igTestUrl));
+        const igOut = await analyzeWithTimeout(
+          ["--get-id", "--no-playlist", "--no-warnings", "--impersonate", "Chrome", cleanIg],
+          20000,
+        );
+        checks.instagram = igOut.trim() ? "ok" : "failed";
+      }
+
+      return res.json({
+        status: "ok",
+        timestamp: Date.now(),
+        proxies: proxyList.length,
+        checks,
+      });
+    } catch (error: any) {
+      return res.status(503).json({
+        status: "degraded",
+        timestamp: Date.now(),
+        checks,
+        error: error?.message || "health check failed",
+      });
+    }
   });
 
   app.post("/api/analyze", async (req: Request, res: Response) => {
@@ -469,7 +799,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "URL is required" });
       }
 
-      const cleanUrl = sanitizeUrl(url);
+      const cleanUrl = normalizeUrl(sanitizeUrl(url));
       if (!isValidUrl(cleanUrl)) {
         return res.status(400).json({ error: "Invalid URL provided" });
       }
@@ -484,33 +814,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const platform = detectPlatform(cleanUrl);
-      const needsImpersonate = ["Instagram", "Twitter/X"].includes(platform);
       const platformNeedsProxy = false;
-
-      function buildAnalyzeArgs(proxyUrl?: string): string[] {
-        return [
-          "--dump-json",
-          "--no-download",
-          "--no-playlist",
-          "--no-warnings",
-          "--no-check-certificates",
-          "--no-check-formats",
-          "--skip-download",
-          "--socket-timeout", "15",
-          "--retries", "2",
-          ...(needsImpersonate ? ["--impersonate", "Chrome"] : []),
-          ...(proxyUrl ? ["--proxy", proxyUrl] : []),
-          ...getCookiesArgs(),
-          cleanUrl,
-        ];
-      }
-
-      console.log("Analyzing:", cleanUrl, `(platform: ${platform}, impersonate: ${needsImpersonate})`);
+      console.log("Analyzing:", cleanUrl, `(platform: ${platform})`);
       const startTime = Date.now();
 
       let stdout = "";
       try {
-        stdout = await analyzeWithTimeout(buildAnalyzeArgs(), 45000);
+        stdout = await runAnalyzeStrategies(platform, cleanUrl);
       } catch (directErr: any) {
         const errMsg = (directErr.stderr || "").toLowerCase();
         const isBlocked = errMsg.includes("blocked") || errMsg.includes("forbidden") || errMsg.includes("403") || errMsg.includes("rate-limit");
@@ -526,7 +836,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
             if (!proxyUrl) break;
             try {
               console.log(`Proxy attempt ${i + 1}/${maxProxyTries}: ${proxyUrl}`);
-              stdout = await analyzeWithTimeout(buildAnalyzeArgs(proxyUrl), 30000);
+              const proxiedArgs = [
+                "--dump-json",
+                "--no-download",
+                "--no-playlist",
+                "--no-warnings",
+                "--no-check-certificates",
+                "--no-check-formats",
+                "--skip-download",
+                "--socket-timeout",
+                "15",
+                "--retries",
+                "2",
+                "--proxy",
+                proxyUrl,
+                ...(["Instagram", "Twitter/X", "Video"].includes(platform) ? ["--impersonate", "Chrome"] : []),
+                ...getCookiesArgs(),
+                cleanUrl,
+              ];
+              stdout = await analyzeWithTimeout(proxiedArgs, 30000);
               console.log(`Proxy ${proxyUrl} worked!`);
               proxySuccess = true;
               break;
@@ -610,20 +938,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (error.message?.includes("timeout")) {
         return res.status(504).json({ error: "Analysis timed out. Try a shorter video or different URL." });
       }
-      const stderrMsg = (error.stderr || "").toLowerCase();
-      if (stderrMsg.includes("login required") || stderrMsg.includes("sign in") || stderrMsg.includes("authentication")) {
-        return res.status(403).json({ error: "This platform requires login cookies. Contact admin to set up cookies." });
-      }
-      if (stderrMsg.includes("blocked") || stderrMsg.includes("ip")) {
-        return res.status(403).json({ error: "Access blocked by this platform. The server IP may be restricted." });
-      }
-      if (stderrMsg.includes("not available") || stderrMsg.includes("removed") || stderrMsg.includes("deleted")) {
-        return res.status(404).json({ error: "This video is not available. It may have been removed or is private." });
-      }
-      if (stderrMsg.includes("no video") || stderrMsg.includes("unable to extract")) {
-        return res.status(404).json({ error: "No video found at this URL. Make sure the link is correct." });
-      }
-      return res.status(500).json({ error: "Failed to analyze video. Please check the URL and try again." });
+      const mapped = mapYtDlpError(error.stderr || error.message || "");
+      return res.status(mapped.status).json({ error: mapped.message, bucket: mapped.bucket });
     }
   });
 
@@ -650,7 +966,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           return res.status(400).json({ error: "URL is required" });
         }
 
-        const cleanUrl = sanitizeUrl(url);
+        const cleanUrl = normalizeUrl(sanitizeUrl(url));
         if (!isValidUrl(cleanUrl)) {
           return res.status(400).json({ error: "Invalid URL" });
         }
@@ -662,80 +978,41 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const hasFfmpeg = await checkFfmpeg();
         const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
         const dlPlatform = detectPlatform(cleanUrl);
-        const dlNeedsImpersonate = ["Instagram", "Twitter/X"].includes(dlPlatform);
-        const dlNeedsProxy = false;
-
-        let dlProxyArgs: string[] = [];
-        if (dlNeedsProxy) {
-          await fetchProxies();
-          const proxy = getNextProxy();
-          if (proxy) {
-            dlProxyArgs = ["--proxy", proxy];
-            console.log(`Download using proxy: ${proxy}`);
-          }
-        }
-
-        const args: string[] = [
-          "--no-playlist",
-          "--no-warnings",
-          "--no-check-certificates",
-          "--socket-timeout", "15",
-          "--retries", "3",
-          "--concurrent-fragments", "4",
-          "--buffer-size", "16K",
-          ...(dlNeedsImpersonate ? ["--impersonate", "Chrome"] : []),
-          ...dlProxyArgs,
-          ...getCookiesArgs(),
-        ];
-
-        let ext: string;
-
-        if (type === "audio") {
-          ext = hasFfmpeg ? "mp3" : "m4a";
-          const outputPath = path.join(TEMP_DIR, `${fileId}.${ext}`);
-          args.push("-o", outputPath);
-
-          if (hasFfmpeg) {
-            args.push("-f", "bestaudio", "--extract-audio", "--audio-format", "mp3");
-          } else {
-            args.push("-f", "bestaudio[ext=m4a]/bestaudio");
-          }
-        } else {
-          ext = "mp4";
-          const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`);
-          args.push("-o", outputPath);
-
-          const resHeight = quality ? parseInt(quality) : 0;
-
-          if (hasFfmpeg) {
-            if (resHeight > 0) {
-              args.push("-S", `res:${resHeight},vcodec:h264,acodec:aac,ext:mp4`);
-            } else {
-              args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
-            }
-            args.push("-f", "bv*+ba/b");
-            args.push("--merge-output-format", "mp4");
-            args.push("--remux-video", "mp4");
-          } else {
-            args.push("-f", "best[ext=mp4]/best");
-          }
-        }
-
-        args.push(cleanUrl);
+        const ext = type === "audio" ? (hasFfmpeg ? "mp3" : "m4a") : "mp4";
+        const outputPath =
+          type === "audio"
+            ? path.join(TEMP_DIR, `${fileId}.${ext}`)
+            : path.join(TEMP_DIR, `${fileId}.%(ext)s`);
+        const downloadStrategies = buildDownloadStrategies({
+          platform: dlPlatform,
+          cleanUrl,
+          outputPath,
+          type,
+          quality,
+          hasFfmpeg,
+        });
 
         console.log("Download started:", cleanUrl);
         const startTime = Date.now();
 
         const downloadTimeout = 30 * 60 * 1000;
-
-        const result = await downloadWithSpawn(args, downloadTimeout);
-        if (result.code !== 0) {
-          console.error("yt-dlp error:", result.stderr);
-          const stderrMsg = result.stderr;
-          if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
-            return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+        let result: { code: number; stderr: string } | null = null;
+        for (let i = 0; i < downloadStrategies.length; i++) {
+          if (BACKOFF_MS[i]) {
+            await sleep(BACKOFF_MS[i]);
           }
-          return res.status(500).json({ error: `Download failed: ${stderrMsg.split('\n').filter((l: string) => l.startsWith('ERROR')).join('; ') || 'Unknown error'}` });
+          const current = await downloadWithSpawn(downloadStrategies[i], downloadTimeout);
+          if (current.code === 0) {
+            result = current;
+            break;
+          }
+          result = current;
+          console.log(`Download strategy ${i + 1} failed, trying fallback...`);
+        }
+
+        if (!result || result.code !== 0) {
+          const mapped = mapYtDlpError(result?.stderr || "Download failed");
+          return res.status(mapped.status).json({ error: mapped.message, bucket: mapped.bucket });
         }
 
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -762,7 +1039,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         if (error.message?.includes("timed out")) {
           return res.status(504).json({ error: "Download timed out. Video might be too long or slow." });
         }
-        return res.status(500).json({ error: "Failed to download video. Please try again." });
+        const mapped = mapYtDlpError(error.stderr || error.message || "");
+        return res.status(mapped.status).json({ error: mapped.message, bucket: mapped.bucket });
       } finally {
         activeDownloads--;
         console.log(`Download slot freed. Active: ${activeDownloads}/${MAX_CONCURRENT_DOWNLOADS}`);
@@ -822,7 +1100,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "URL is required" });
       }
 
-      const cleanUrl = sanitizeUrl(url);
+      const cleanUrl = normalizeUrl(sanitizeUrl(url));
       if (!isValidUrl(cleanUrl)) {
         return res.status(400).json({ error: "Invalid URL" });
       }
@@ -843,7 +1121,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "--no-playlist",
         "--no-warnings",
         "--no-check-certificates",
-        "--socket-timeout", "10",
+        "--socket-timeout", "15",
+        "--retries", "3",
+        ...(["Instagram", "Twitter/X"].includes(platform) ? ["--impersonate", "Chrome"] : []),
         ...getCookiesArgs(),
         "-f", "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
         cleanUrl,
@@ -875,7 +1155,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "URL is required" });
       }
 
-      const cleanUrl = sanitizeUrl(url);
+      const cleanUrl = normalizeUrl(sanitizeUrl(url));
       if (!isValidUrl(cleanUrl)) {
         return res.status(400).json({ error: "Invalid URL" });
       }

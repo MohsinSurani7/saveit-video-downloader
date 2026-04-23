@@ -1,41 +1,44 @@
-"use strict";
-var __create = Object.create;
-var __defProp = Object.defineProperty;
-var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
-var __getOwnPropNames = Object.getOwnPropertyNames;
-var __getProtoOf = Object.getPrototypeOf;
-var __hasOwnProp = Object.prototype.hasOwnProperty;
-var __copyProps = (to, from, except, desc) => {
-  if (from && typeof from === "object" || typeof from === "function") {
-    for (let key of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key) && key !== except)
-        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
-  }
-  return to;
-};
-var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
-  // If the importer is in node compatibility mode or this is not an ESM
-  // file that has been converted to a CommonJS file using a Babel-
-  // compatible transform (i.e. "__esModule" has not been set), then set
-  // "default" to the CommonJS "module.exports" for node compatibility.
-  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
-  mod
-));
-
 // server/index.ts
-var import_express = __toESM(require("express"));
+import express from "express";
 
 // server/routes.ts
-var import_node_http = require("node:http");
-var import_node_child_process = require("node:child_process");
-var import_node_util = require("node:util");
-var path = __toESM(require("node:path"));
-var fs = __toESM(require("node:fs"));
-var os = __toESM(require("node:os"));
-var https = __toESM(require("node:https"));
-var http = __toESM(require("node:http"));
-var execFileAsync = (0, import_node_util.promisify)(import_node_child_process.execFile);
-var YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
+import { createServer } from "node:http";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
+import * as path from "node:path";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as https from "node:https";
+import * as http from "node:http";
+var execFileAsync = promisify(execFile);
+function resolveYtDlpCommand() {
+  const envPath = process.env.YT_DLP_PATH?.trim();
+  if (envPath) {
+    return { command: envPath, baseArgs: [] };
+  }
+  const candidatePaths = [
+    path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp"),
+    path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp.exe"),
+    path.join(process.cwd(), ".pythonlibs", "Scripts", "yt-dlp.exe"),
+    path.join(process.cwd(), ".venv", "Scripts", "yt-dlp.exe"),
+    path.join(process.cwd(), ".venv", "bin", "yt-dlp")
+  ];
+  const localBinary = candidatePaths.find((candidate) => fs.existsSync(candidate));
+  if (localBinary) {
+    return { command: localBinary, baseArgs: [] };
+  }
+  if (process.env.YT_DLP_USE_PYTHON_MODULE === "1") {
+    return {
+      command: process.env.PYTHON_PATH || "python",
+      baseArgs: ["-m", "yt_dlp"]
+    };
+  }
+  return {
+    command: process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp",
+    baseArgs: []
+  };
+}
+var YT_DLP_COMMAND = resolveYtDlpCommand();
 var COOKIES_PATH = process.env.COOKIES_PATH || path.join(process.cwd(), "cookies.txt");
 var CUSTOM_PROXY = process.env.PROXY_URL || "";
 function getCookiesArgs() {
@@ -135,6 +138,7 @@ async function checkFfmpeg() {
 }
 var analysisCache = /* @__PURE__ */ new Map();
 var CACHE_TTL = 10 * 60 * 1e3;
+var BACKOFF_MS = [0, 800, 1600];
 function isValidUrl(str) {
   try {
     const url = new URL(str);
@@ -145,6 +149,99 @@ function isValidUrl(str) {
 }
 function sanitizeUrl(url) {
   return url.trim().replace(/[;&|`$(){}]/g, "");
+}
+function normalizeUrl(inputUrl) {
+  try {
+    const parsed = new URL(inputUrl);
+    const host = parsed.hostname.toLowerCase();
+    const normalizedHost = host.replace(/^m\./, "").replace(/^www\./, "");
+    if (normalizedHost === "youtu.be") {
+      const videoId = parsed.pathname.split("/").filter(Boolean)[0];
+      if (videoId) {
+        const next = new URL("https://www.youtube.com/watch");
+        next.searchParams.set("v", videoId);
+        return next.toString();
+      }
+    }
+    if (normalizedHost === "youtube.com") {
+      if (parsed.pathname.startsWith("/shorts/")) {
+        const videoId = parsed.pathname.split("/").filter(Boolean)[1];
+        if (videoId) {
+          const next = new URL("https://www.youtube.com/watch");
+          next.searchParams.set("v", videoId);
+          return next.toString();
+        }
+      }
+      if (parsed.pathname === "/watch") {
+        const next = new URL("https://www.youtube.com/watch");
+        const v = parsed.searchParams.get("v");
+        if (v) {
+          next.searchParams.set("v", v);
+          return next.toString();
+        }
+      }
+    }
+    if (normalizedHost === "instagram.com") {
+      parsed.search = "";
+      return parsed.toString();
+    }
+    return parsed.toString();
+  } catch {
+    return inputUrl;
+  }
+}
+function sleep(ms) {
+  return new Promise((resolve2) => setTimeout(resolve2, ms));
+}
+function mapYtDlpError(stderrText) {
+  const stderrMsg = (stderrText || "").toLowerCase();
+  if (stderrMsg.includes("timed out") || stderrMsg.includes("timeout")) {
+    return {
+      bucket: "timeout",
+      status: 504,
+      message: "Request timed out while contacting the video platform. Please retry."
+    };
+  }
+  if (stderrMsg.includes("login required") || stderrMsg.includes("sign in") || stderrMsg.includes("authentication")) {
+    return {
+      bucket: "private_or_restricted",
+      status: 422,
+      message: "This video is private or restricted by the platform. Please try a public link."
+    };
+  }
+  if (stderrMsg.includes("rate-limit") || stderrMsg.includes("too many requests")) {
+    return {
+      bucket: "rate_limited",
+      status: 429,
+      message: "Platform rate limit reached. Please retry in a few minutes."
+    };
+  }
+  if (stderrMsg.includes("blocked") || stderrMsg.includes("forbidden") || stderrMsg.includes("403") || stderrMsg.includes("geo")) {
+    return {
+      bucket: "geo_or_network",
+      status: 403,
+      message: "This content is blocked in the current server region or by network policy."
+    };
+  }
+  if (stderrMsg.includes("not available") || stderrMsg.includes("removed") || stderrMsg.includes("deleted") || stderrMsg.includes("private video")) {
+    return {
+      bucket: "not_found_or_removed",
+      status: 404,
+      message: "This video is not available anymore or has been removed."
+    };
+  }
+  if (stderrMsg.includes("no video") || stderrMsg.includes("unable to extract")) {
+    return {
+      bucket: "unsupported_or_extract_failed",
+      status: 422,
+      message: "Could not extract this link. Try a direct public post/video URL."
+    };
+  }
+  return {
+    bucket: "unknown",
+    status: 500,
+    message: "Unable to process this URL right now. Please try again."
+  };
 }
 function sanitizeFilename(name) {
   return name.replace(/[^a-zA-Z0-9._\- ]/g, "_").slice(0, 100);
@@ -164,6 +261,10 @@ var ALLOWED_HOSTS = [
   "www.twitter.com",
   "x.com",
   "www.x.com",
+  "ok.ru",
+  "www.ok.ru",
+  "ok.com",
+  "www.ok.com",
   "vimeo.com",
   "www.vimeo.com",
   "player.vimeo.com",
@@ -199,6 +300,7 @@ function detectPlatform(url) {
   if (hostname.includes("youtube.com") || hostname.includes("youtu.be")) return "Video";
   if (hostname.includes("facebook.com") || hostname.includes("fb.watch")) return "Facebook";
   if (hostname.includes("instagram.com")) return "Instagram";
+  if (hostname.includes("ok.ru") || hostname.includes("ok.com")) return "OK";
   if (hostname.includes("tiktok.com")) return "TikTok";
   if (hostname.includes("twitter.com") || hostname.includes("x.com")) return "Twitter/X";
   if (hostname.includes("vimeo.com")) return "Vimeo";
@@ -207,6 +309,130 @@ function detectPlatform(url) {
   if (hostname.includes("twitch.tv")) return "Twitch";
   if (hostname.includes("soundcloud.com")) return "SoundCloud";
   return "Other";
+}
+function buildAnalyzeStrategies(platform, cleanUrl) {
+  const base = [
+    "--dump-json",
+    "--no-download",
+    "--no-playlist",
+    "--no-warnings",
+    "--no-check-certificates",
+    "--no-check-formats",
+    "--skip-download",
+    "--socket-timeout",
+    platform === "Video" ? "20" : "15",
+    "--retries",
+    platform === "Video" ? "3" : "2",
+    ...getCookiesArgs()
+  ];
+  const strategies = [];
+  strategies.push([...base, cleanUrl]);
+  if (["Instagram", "Twitter/X", "Video"].includes(platform)) {
+    strategies.push([...base, "--impersonate", "Chrome", cleanUrl]);
+  }
+  if (platform === "Video") {
+    strategies.push([
+      ...base,
+      "--extractor-args",
+      "youtube:player_client=android,web",
+      "--impersonate",
+      "Chrome",
+      cleanUrl
+    ]);
+  }
+  return strategies;
+}
+function isRetryableAnalyzeError(stderrText) {
+  const stderrMsg = (stderrText || "").toLowerCase();
+  return stderrMsg.includes("timed out") || stderrMsg.includes("timeout") || stderrMsg.includes("429") || stderrMsg.includes("rate-limit") || stderrMsg.includes("http error 5") || stderrMsg.includes("temporary");
+}
+async function runAnalyzeStrategies(platform, cleanUrl) {
+  const strategies = buildAnalyzeStrategies(platform, cleanUrl);
+  let lastError = new Error("No analyze strategy attempted");
+  for (let attempt = 0; attempt < strategies.length; attempt++) {
+    const args = strategies[attempt];
+    try {
+      if (BACKOFF_MS[attempt]) {
+        await sleep(BACKOFF_MS[attempt]);
+      }
+      return await analyzeWithTimeout(args, attempt === 0 ? 45e3 : 35e3);
+    } catch (error) {
+      lastError = error;
+      const retryable = isRetryableAnalyzeError(error?.stderr || error?.message || "");
+      if (!retryable && attempt === 0 && strategies.length > 1) {
+        continue;
+      }
+    }
+  }
+  throw lastError;
+}
+function buildDownloadStrategies({
+  platform,
+  cleanUrl,
+  outputPath,
+  type,
+  quality,
+  hasFfmpeg
+}) {
+  const common = [
+    "--no-playlist",
+    "--no-warnings",
+    "--no-check-certificates",
+    "--socket-timeout",
+    "20",
+    "--retries",
+    "4",
+    "--concurrent-fragments",
+    "4",
+    "--buffer-size",
+    "16K",
+    ...getCookiesArgs(),
+    ...platform === "Instagram" || platform === "Twitter/X" || platform === "Video" ? ["--impersonate", "Chrome"] : [],
+    "-o",
+    outputPath
+  ];
+  if (type === "audio") {
+    if (hasFfmpeg) {
+      return [
+        [...common, "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", cleanUrl],
+        [...common, "-f", "bestaudio[ext=m4a]/bestaudio", cleanUrl]
+      ];
+    }
+    return [[...common, "-f", "bestaudio[ext=m4a]/bestaudio", cleanUrl]];
+  }
+  const resHeight = quality ? parseInt(quality, 10) : 0;
+  if (hasFfmpeg) {
+    const sortExpr = resHeight > 0 ? `res:${resHeight},vcodec:h264,acodec:aac,ext:mp4` : "vcodec:h264,acodec:aac,ext:mp4,res";
+    return [
+      [
+        ...common,
+        "-S",
+        sortExpr,
+        "-f",
+        "bv*+ba/b",
+        "--merge-output-format",
+        "mp4",
+        "--remux-video",
+        "mp4",
+        cleanUrl
+      ],
+      [...common, "-f", "best[ext=mp4][vcodec!=none][acodec!=none]/best", cleanUrl],
+      [...common, "-f", "best", cleanUrl]
+    ];
+  }
+  return [
+    [...common, "-f", "best[ext=mp4]/best", cleanUrl],
+    [...common, "-f", "best", cleanUrl]
+  ];
+}
+async function runYtDlpAutoUpdate() {
+  try {
+    const args = [...YT_DLP_COMMAND.baseArgs, "-U"];
+    await execFileAsync(YT_DLP_COMMAND.command, args, { timeout: 45e3 });
+    console.log("yt-dlp update check completed");
+  } catch (error) {
+    console.log(`yt-dlp auto-update skipped/failed: ${error?.message || "unknown"}`);
+  }
 }
 function parseFormats(rawFormats) {
   if (!rawFormats) return [];
@@ -303,7 +529,8 @@ function cleanupOldFiles() {
 setInterval(cleanupOldFiles, 5 * 60 * 1e3);
 function analyzeWithTimeout(args, timeoutMs) {
   return new Promise((resolve2, reject) => {
-    const proc = (0, import_node_child_process.spawn)(YT_DLP_PATH, args, {
+    const fullArgs = [...YT_DLP_COMMAND.baseArgs, ...args];
+    const proc = spawn(YT_DLP_COMMAND.command, fullArgs, {
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
@@ -333,13 +560,17 @@ function analyzeWithTimeout(args, timeoutMs) {
     });
     proc.on("error", (err) => {
       clearTimeout(timer);
+      if (err.code === "ENOENT") {
+        return reject(new Error("yt-dlp not found. Install yt-dlp or set YT_DLP_PATH."));
+      }
       reject(err);
     });
   });
 }
 function downloadWithSpawn(args, timeoutMs) {
   return new Promise((resolve2, reject) => {
-    const proc = (0, import_node_child_process.spawn)(YT_DLP_PATH, args, {
+    const fullArgs = [...YT_DLP_COMMAND.baseArgs, ...args];
+    const proc = spawn(YT_DLP_COMMAND.command, fullArgs, {
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stderr = "";
@@ -364,39 +595,63 @@ function downloadWithSpawn(args, timeoutMs) {
     });
     proc.on("error", (err) => {
       clearTimeout(timer);
+      if (err.code === "ENOENT") {
+        return reject(new Error("yt-dlp not found. Install yt-dlp or set YT_DLP_PATH."));
+      }
       reject(err);
     });
   });
 }
 async function registerRoutes(app2) {
+  console.log(`Using yt-dlp command: ${YT_DLP_COMMAND.command}`);
   checkFfmpeg();
   fetchProxies().catch(() => {
   });
+  runYtDlpAutoUpdate();
+  setInterval(() => {
+    runYtDlpAutoUpdate();
+  }, 12 * 60 * 60 * 1e3);
   app2.get("/api/health", (_req, res) => {
     res.json({ status: "ok", timestamp: Date.now(), proxies: proxyList.length });
   });
+  app2.get("/api/health/deep", async (_req, res) => {
+    const ytTestUrl = process.env.HEALTHCHECK_YT_URL;
+    const igTestUrl = process.env.HEALTHCHECK_IG_URL;
+    const checks = {};
+    try {
+      if (ytTestUrl) {
+        const cleanYt = normalizeUrl(sanitizeUrl(ytTestUrl));
+        const ytOut = await analyzeWithTimeout(
+          ["--get-id", "--no-playlist", "--no-warnings", cleanYt],
+          2e4
+        );
+        checks.youtube = ytOut.trim() ? "ok" : "failed";
+      }
+      if (igTestUrl) {
+        const cleanIg = normalizeUrl(sanitizeUrl(igTestUrl));
+        const igOut = await analyzeWithTimeout(
+          ["--get-id", "--no-playlist", "--no-warnings", "--impersonate", "Chrome", cleanIg],
+          2e4
+        );
+        checks.instagram = igOut.trim() ? "ok" : "failed";
+      }
+      return res.json({
+        status: "ok",
+        timestamp: Date.now(),
+        proxies: proxyList.length,
+        checks
+      });
+    } catch (error) {
+      return res.status(503).json({
+        status: "degraded",
+        timestamp: Date.now(),
+        checks,
+        error: error?.message || "health check failed"
+      });
+    }
+  });
   app2.post("/api/analyze", async (req, res) => {
     try {
-      let buildAnalyzeArgs2 = function(proxyUrl) {
-        return [
-          "--dump-json",
-          "--no-download",
-          "--no-playlist",
-          "--no-warnings",
-          "--no-check-certificates",
-          "--no-check-formats",
-          "--skip-download",
-          "--socket-timeout",
-          "15",
-          "--retries",
-          "2",
-          ...needsImpersonate ? ["--impersonate", "Chrome"] : [],
-          ...proxyUrl ? ["--proxy", proxyUrl] : [],
-          ...getCookiesArgs(),
-          cleanUrl
-        ];
-      };
-      var buildAnalyzeArgs = buildAnalyzeArgs2;
       const ip = req.ip || req.socket.remoteAddress || "unknown";
       if (!checkRateLimit(ip)) {
         return res.status(429).json({ error: "Too many requests. Please try again later." });
@@ -405,7 +660,7 @@ async function registerRoutes(app2) {
       if (!url || typeof url !== "string") {
         return res.status(400).json({ error: "URL is required" });
       }
-      const cleanUrl = sanitizeUrl(url);
+      const cleanUrl = normalizeUrl(sanitizeUrl(url));
       if (!isValidUrl(cleanUrl)) {
         return res.status(400).json({ error: "Invalid URL provided" });
       }
@@ -417,13 +672,12 @@ async function registerRoutes(app2) {
         return res.json(cached.data);
       }
       const platform = detectPlatform(cleanUrl);
-      const needsImpersonate = ["Instagram", "Twitter/X"].includes(platform);
       const platformNeedsProxy = false;
-      console.log("Analyzing:", cleanUrl, `(platform: ${platform}, impersonate: ${needsImpersonate})`);
+      console.log("Analyzing:", cleanUrl, `(platform: ${platform})`);
       const startTime = Date.now();
-      let stdout;
+      let stdout = "";
       try {
-        stdout = await analyzeWithTimeout(buildAnalyzeArgs2(), 45e3);
+        stdout = await runAnalyzeStrategies(platform, cleanUrl);
       } catch (directErr) {
         const errMsg = (directErr.stderr || "").toLowerCase();
         const isBlocked = errMsg.includes("blocked") || errMsg.includes("forbidden") || errMsg.includes("403") || errMsg.includes("rate-limit");
@@ -437,7 +691,25 @@ async function registerRoutes(app2) {
             if (!proxyUrl) break;
             try {
               console.log(`Proxy attempt ${i + 1}/${maxProxyTries}: ${proxyUrl}`);
-              stdout = await analyzeWithTimeout(buildAnalyzeArgs2(proxyUrl), 3e4);
+              const proxiedArgs = [
+                "--dump-json",
+                "--no-download",
+                "--no-playlist",
+                "--no-warnings",
+                "--no-check-certificates",
+                "--no-check-formats",
+                "--skip-download",
+                "--socket-timeout",
+                "15",
+                "--retries",
+                "2",
+                "--proxy",
+                proxyUrl,
+                ...["Instagram", "Twitter/X", "Video"].includes(platform) ? ["--impersonate", "Chrome"] : [],
+                ...getCookiesArgs(),
+                cleanUrl
+              ];
+              stdout = await analyzeWithTimeout(proxiedArgs, 3e4);
               console.log(`Proxy ${proxyUrl} worked!`);
               proxySuccess = true;
               break;
@@ -508,20 +780,8 @@ async function registerRoutes(app2) {
       if (error.message?.includes("timeout")) {
         return res.status(504).json({ error: "Analysis timed out. Try a shorter video or different URL." });
       }
-      const stderrMsg = (error.stderr || "").toLowerCase();
-      if (stderrMsg.includes("login required") || stderrMsg.includes("sign in") || stderrMsg.includes("authentication")) {
-        return res.status(403).json({ error: "This platform requires login cookies. Contact admin to set up cookies." });
-      }
-      if (stderrMsg.includes("blocked") || stderrMsg.includes("ip")) {
-        return res.status(403).json({ error: "Access blocked by this platform. The server IP may be restricted." });
-      }
-      if (stderrMsg.includes("not available") || stderrMsg.includes("removed") || stderrMsg.includes("deleted")) {
-        return res.status(404).json({ error: "This video is not available. It may have been removed or is private." });
-      }
-      if (stderrMsg.includes("no video") || stderrMsg.includes("unable to extract")) {
-        return res.status(404).json({ error: "No video found at this URL. Make sure the link is correct." });
-      }
-      return res.status(500).json({ error: "Failed to analyze video. Please check the URL and try again." });
+      const mapped = mapYtDlpError(error.stderr || error.message || "");
+      return res.status(mapped.status).json({ error: mapped.message, bucket: mapped.bucket });
     }
   });
   let activeDownloads = 0;
@@ -542,7 +802,7 @@ async function registerRoutes(app2) {
         if (!url || typeof url !== "string") {
           return res.status(400).json({ error: "URL is required" });
         }
-        const cleanUrl = sanitizeUrl(url);
+        const cleanUrl = normalizeUrl(sanitizeUrl(url));
         if (!isValidUrl(cleanUrl)) {
           return res.status(400).json({ error: "Invalid URL" });
         }
@@ -552,73 +812,35 @@ async function registerRoutes(app2) {
         const hasFfmpeg = await checkFfmpeg();
         const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
         const dlPlatform = detectPlatform(cleanUrl);
-        const dlNeedsImpersonate = ["Instagram", "Twitter/X"].includes(dlPlatform);
-        const dlNeedsProxy = false;
-        let dlProxyArgs = [];
-        if (dlNeedsProxy) {
-          await fetchProxies();
-          const proxy = getNextProxy();
-          if (proxy) {
-            dlProxyArgs = ["--proxy", proxy];
-            console.log(`Download using proxy: ${proxy}`);
-          }
-        }
-        const args = [
-          "--no-playlist",
-          "--no-warnings",
-          "--no-check-certificates",
-          "--socket-timeout",
-          "15",
-          "--retries",
-          "3",
-          "--concurrent-fragments",
-          "4",
-          "--buffer-size",
-          "16K",
-          ...dlNeedsImpersonate ? ["--impersonate", "Chrome"] : [],
-          ...dlProxyArgs,
-          ...getCookiesArgs()
-        ];
-        let ext;
-        if (type === "audio") {
-          ext = hasFfmpeg ? "mp3" : "m4a";
-          const outputPath = path.join(TEMP_DIR, `${fileId}.${ext}`);
-          args.push("-o", outputPath);
-          if (hasFfmpeg) {
-            args.push("-f", "bestaudio", "--extract-audio", "--audio-format", "mp3");
-          } else {
-            args.push("-f", "bestaudio[ext=m4a]/bestaudio");
-          }
-        } else {
-          ext = "mp4";
-          const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`);
-          args.push("-o", outputPath);
-          const resHeight = quality ? parseInt(quality) : 0;
-          if (hasFfmpeg) {
-            if (resHeight > 0) {
-              args.push("-S", `res:${resHeight},vcodec:h264,acodec:aac,ext:mp4`);
-            } else {
-              args.push("-S", "vcodec:h264,acodec:aac,ext:mp4,res");
-            }
-            args.push("-f", "bv*+ba/b");
-            args.push("--merge-output-format", "mp4");
-            args.push("--remux-video", "mp4");
-          } else {
-            args.push("-f", "best[ext=mp4]/best");
-          }
-        }
-        args.push(cleanUrl);
+        const ext = type === "audio" ? hasFfmpeg ? "mp3" : "m4a" : "mp4";
+        const outputPath = type === "audio" ? path.join(TEMP_DIR, `${fileId}.${ext}`) : path.join(TEMP_DIR, `${fileId}.%(ext)s`);
+        const downloadStrategies = buildDownloadStrategies({
+          platform: dlPlatform,
+          cleanUrl,
+          outputPath,
+          type,
+          quality,
+          hasFfmpeg
+        });
         console.log("Download started:", cleanUrl);
         const startTime = Date.now();
         const downloadTimeout = 30 * 60 * 1e3;
-        const result = await downloadWithSpawn(args, downloadTimeout);
-        if (result.code !== 0) {
-          console.error("yt-dlp error:", result.stderr);
-          const stderrMsg = result.stderr;
-          if (stderrMsg.includes("login required") || stderrMsg.includes("Sign in")) {
-            return res.status(403).json({ error: "This platform requires authentication. Please set up cookies." });
+        let result = null;
+        for (let i = 0; i < downloadStrategies.length; i++) {
+          if (BACKOFF_MS[i]) {
+            await sleep(BACKOFF_MS[i]);
           }
-          return res.status(500).json({ error: `Download failed: ${stderrMsg.split("\n").filter((l) => l.startsWith("ERROR")).join("; ") || "Unknown error"}` });
+          const current = await downloadWithSpawn(downloadStrategies[i], downloadTimeout);
+          if (current.code === 0) {
+            result = current;
+            break;
+          }
+          result = current;
+          console.log(`Download strategy ${i + 1} failed, trying fallback...`);
+        }
+        if (!result || result.code !== 0) {
+          const mapped = mapYtDlpError(result?.stderr || "Download failed");
+          return res.status(mapped.status).json({ error: mapped.message, bucket: mapped.bucket });
         }
         const elapsed = ((Date.now() - startTime) / 1e3).toFixed(1);
         console.log(`Download completed in ${elapsed}s`);
@@ -640,7 +862,8 @@ async function registerRoutes(app2) {
         if (error.message?.includes("timed out")) {
           return res.status(504).json({ error: "Download timed out. Video might be too long or slow." });
         }
-        return res.status(500).json({ error: "Failed to download video. Please try again." });
+        const mapped = mapYtDlpError(error.stderr || error.message || "");
+        return res.status(mapped.status).json({ error: mapped.message, bucket: mapped.bucket });
       } finally {
         activeDownloads--;
         console.log(`Download slot freed. Active: ${activeDownloads}/${MAX_CONCURRENT_DOWNLOADS}`);
@@ -652,7 +875,7 @@ async function registerRoutes(app2) {
   app2.get("/api/file/:fileId", (req, res) => {
     try {
       const { fileId } = req.params;
-      const safeName = fileId.replace(/[^a-zA-Z0-9._-]/g, "");
+      const safeName = String(fileId).replace(/[^a-zA-Z0-9._-]/g, "");
       const filePath = path.join(TEMP_DIR, safeName);
       if (!fs.existsSync(filePath)) {
         return res.status(404).json({ error: "File not found or expired" });
@@ -693,7 +916,7 @@ async function registerRoutes(app2) {
       if (!url || typeof url !== "string") {
         return res.status(400).json({ error: "URL is required" });
       }
-      const cleanUrl = sanitizeUrl(url);
+      const cleanUrl = normalizeUrl(sanitizeUrl(url));
       if (!isValidUrl(cleanUrl)) {
         return res.status(400).json({ error: "Invalid URL" });
       }
@@ -711,7 +934,10 @@ async function registerRoutes(app2) {
         "--no-warnings",
         "--no-check-certificates",
         "--socket-timeout",
-        "10",
+        "15",
+        "--retries",
+        "3",
+        ...["Instagram", "Twitter/X"].includes(platform) ? ["--impersonate", "Chrome"] : [],
         ...getCookiesArgs(),
         "-f",
         "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
@@ -737,7 +963,7 @@ async function registerRoutes(app2) {
       if (!url || typeof url !== "string") {
         return res.status(400).json({ error: "URL is required" });
       }
-      const cleanUrl = sanitizeUrl(url);
+      const cleanUrl = normalizeUrl(sanitizeUrl(url));
       if (!isValidUrl(cleanUrl)) {
         return res.status(400).json({ error: "Invalid URL" });
       }
@@ -756,14 +982,14 @@ async function registerRoutes(app2) {
       return res.status(500).json({ error: "Failed to get thumbnail" });
     }
   });
-  const httpServer = (0, import_node_http.createServer)(app2);
+  const httpServer = createServer(app2);
   return httpServer;
 }
 
 // server/index.ts
-var fs2 = __toESM(require("fs"));
-var path2 = __toESM(require("path"));
-var app = (0, import_express.default)();
+import * as fs2 from "fs";
+import * as path2 from "path";
+var app = express();
 var log = console.log;
 function setupCors(app2) {
   app2.use((req, res, next) => {
@@ -795,13 +1021,13 @@ function setupCors(app2) {
 }
 function setupBodyParsing(app2) {
   app2.use(
-    import_express.default.json({
+    express.json({
       verify: (req, _res, buf) => {
         req.rawBody = buf;
       }
     })
   );
-  app2.use(import_express.default.urlencoded({ extended: false }));
+  app2.use(express.urlencoded({ extended: false }));
 }
 function setupRequestLogging(app2) {
   app2.use((req, res, next) => {
@@ -903,8 +1129,8 @@ function configureExpoAndLanding(app2) {
     }
     next();
   });
-  app2.use("/assets", import_express.default.static(path2.resolve(process.cwd(), "assets")));
-  app2.use(import_express.default.static(path2.resolve(process.cwd(), "static-build")));
+  app2.use("/assets", express.static(path2.resolve(process.cwd(), "assets")));
+  app2.use(express.static(path2.resolve(process.cwd(), "static-build")));
   log("Expo routing: Checking expo-platform header on / and /manifest");
 }
 function setupErrorHandler(app2) {
