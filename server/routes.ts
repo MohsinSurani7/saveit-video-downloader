@@ -10,7 +10,45 @@ import * as http from "node:http";
 
 const execFileAsync = promisify(execFile);
 
-const YT_DLP_PATH = process.env.YT_DLP_PATH || path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp");
+interface YtDlpCommand {
+  command: string;
+  baseArgs: string[];
+}
+
+function resolveYtDlpCommand(): YtDlpCommand {
+  const envPath = process.env.YT_DLP_PATH?.trim();
+  if (envPath) {
+    return { command: envPath, baseArgs: [] };
+  }
+
+  const candidatePaths = [
+    path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp"),
+    path.join(process.cwd(), ".pythonlibs", "bin", "yt-dlp.exe"),
+    path.join(process.cwd(), ".pythonlibs", "Scripts", "yt-dlp.exe"),
+    path.join(process.cwd(), ".venv", "Scripts", "yt-dlp.exe"),
+    path.join(process.cwd(), ".venv", "bin", "yt-dlp"),
+  ];
+
+  const localBinary = candidatePaths.find((candidate) => fs.existsSync(candidate));
+  if (localBinary) {
+    return { command: localBinary, baseArgs: [] };
+  }
+
+  // Fallback to Python module execution for environments without direct yt-dlp binary.
+  if (process.env.YT_DLP_USE_PYTHON_MODULE === "1") {
+    return {
+      command: process.env.PYTHON_PATH || "python",
+      baseArgs: ["-m", "yt_dlp"],
+    };
+  }
+
+  return {
+    command: process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp",
+    baseArgs: [],
+  };
+}
+
+const YT_DLP_COMMAND = resolveYtDlpCommand();
 const COOKIES_PATH = process.env.COOKIES_PATH || path.join(process.cwd(), "cookies.txt");
 const CUSTOM_PROXY = process.env.PROXY_URL || "";
 
@@ -176,6 +214,7 @@ const ALLOWED_HOSTS = [
   "facebook.com", "www.facebook.com", "fb.watch", "m.facebook.com",
   "instagram.com", "www.instagram.com",
   "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+  "ok.ru", "www.ok.ru", "ok.com", "www.ok.com",
   "vimeo.com", "www.vimeo.com", "player.vimeo.com",
   "dailymotion.com", "www.dailymotion.com",
   "reddit.com", "www.reddit.com",
@@ -204,6 +243,7 @@ function detectPlatform(url: string): string {
   if (hostname.includes("youtube.com") || hostname.includes("youtu.be")) return "Video";
   if (hostname.includes("facebook.com") || hostname.includes("fb.watch")) return "Facebook";
   if (hostname.includes("instagram.com")) return "Instagram";
+  if (hostname.includes("ok.ru") || hostname.includes("ok.com")) return "OK";
   if (hostname.includes("tiktok.com")) return "TikTok";
   if (hostname.includes("twitter.com") || hostname.includes("x.com")) return "Twitter/X";
   if (hostname.includes("vimeo.com")) return "Vimeo";
@@ -322,7 +362,8 @@ setInterval(cleanupOldFiles, 5 * 60 * 1000);
 
 function analyzeWithTimeout(args: string[], timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(YT_DLP_PATH, args, {
+    const fullArgs = [...YT_DLP_COMMAND.baseArgs, ...args];
+    const proc = spawn(YT_DLP_COMMAND.command, fullArgs, {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -358,6 +399,9 @@ function analyzeWithTimeout(args: string[], timeoutMs: number): Promise<string> 
 
     proc.on("error", (err) => {
       clearTimeout(timer);
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return reject(new Error("yt-dlp not found. Install yt-dlp or set YT_DLP_PATH."));
+      }
       reject(err);
     });
   });
@@ -365,7 +409,8 @@ function analyzeWithTimeout(args: string[], timeoutMs: number): Promise<string> 
 
 function downloadWithSpawn(args: string[], timeoutMs: number): Promise<{ code: number; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(YT_DLP_PATH, args, {
+    const fullArgs = [...YT_DLP_COMMAND.baseArgs, ...args];
+    const proc = spawn(YT_DLP_COMMAND.command, fullArgs, {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -395,12 +440,16 @@ function downloadWithSpawn(args: string[], timeoutMs: number): Promise<{ code: n
 
     proc.on("error", (err) => {
       clearTimeout(timer);
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return reject(new Error("yt-dlp not found. Install yt-dlp or set YT_DLP_PATH."));
+      }
       reject(err);
     });
   });
 }
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  console.log(`Using yt-dlp command: ${YT_DLP_COMMAND.command}`);
   checkFfmpeg();
   fetchProxies().catch(() => {});
 
@@ -459,7 +508,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.log("Analyzing:", cleanUrl, `(platform: ${platform}, impersonate: ${needsImpersonate})`);
       const startTime = Date.now();
 
-      let stdout: string;
+      let stdout = "";
       try {
         stdout = await analyzeWithTimeout(buildAnalyzeArgs(), 45000);
       } catch (directErr: any) {
@@ -726,7 +775,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/file/:fileId", (req: Request, res: Response) => {
     try {
       const { fileId } = req.params;
-      const safeName = fileId.replace(/[^a-zA-Z0-9._-]/g, "");
+      const safeName = String(fileId).replace(/[^a-zA-Z0-9._-]/g, "");
       const filePath = path.join(TEMP_DIR, safeName);
 
       if (!fs.existsSync(filePath)) {
